@@ -1,0 +1,11 @@
+node_modules/
+dist/
+output/
+demos/
+.env
+*.webm
+*.mp4
+*.mp3
+.tools/
+test-results/
+demo-results/

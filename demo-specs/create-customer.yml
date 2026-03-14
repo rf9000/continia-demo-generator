@@ -1,0 +1,47 @@
+# BC Page Scripting YAML - Create Customer Demo
+# This is a sample spec. Replace with a real recording from BC's Page Scripting tool.
+# To record: Open BC > Settings (gear icon) > Page Scripting > Start new
+name: Create Customer
+description: Demonstrates how to create a new customer in Business Central.
+start:
+  profile: BUSINESS MANAGER
+
+steps:
+  - type: action
+    target:
+      - page: Role Center
+    description: Search for <caption>Customers</caption>
+    caption: Customers
+
+  - type: action
+    target:
+      - page: Customer List
+    description: Select <caption>New</caption>
+    caption: New
+
+  - type: input
+    target:
+      - page: Customer Card
+      - field: Name
+    description: Input <value>Contoso Ltd</value> into <caption>Name</caption>
+    value: Contoso Ltd
+
+  - type: input
+    target:
+      - page: Customer Card
+      - field: Address
+    description: Input <value>123 Main Street</value> into <caption>Address</caption>
+    value: 123 Main Street
+
+  - type: input
+    target:
+      - page: Customer Card
+      - field: City
+    description: Input <value>Copenhagen</value> into <caption>City</caption>
+    value: Copenhagen
+
+  - type: action
+    target:
+      - page: Customer Card
+    description: Close the page
+    caption: OK
