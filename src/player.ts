@@ -50,7 +50,7 @@ export interface PlayOptions {
 }
 
 const NAV_DELAY_MS = 2000;
-const END_DELAY_MS = 3000;
+const END_DELAY_MS = 2000;
 const NAV_TIMEOUT_MS = 120_000;
 
 export async function playDemo(specPath: string, config: DemoConfig, options?: PlayOptions): Promise<PlayResult> {
