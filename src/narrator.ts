@@ -35,10 +35,12 @@ export async function generateNarration(
   try {
     console.log(`Generating narration (${text.length} chars, voice: ${options?.voice ?? 'nova'})...`);
 
+    const expandedText = expandAbbreviations(text);
+
     const response = await openai.audio.speech.create({
       model: 'tts-1-hd',
       voice: options?.voice ?? 'nova',
-      input: text,
+      input: expandedText,
       speed: options?.speed ?? 1.0,
       response_format: 'mp3',
     });
@@ -72,6 +74,37 @@ export async function getAudioDuration(audioPath: string): Promise<number> {
       ?? '';
     return parseDuration(output);
   }
+}
+
+// Common BC abbreviations → spoken form for TTS
+const BC_ABBREVIATIONS: [RegExp, string][] = [
+  [/\bNo\./g, 'Number'],
+  [/\bAcc\./g, 'Account'],
+  [/\bRecon\./g, 'Reconciliation'],
+  [/\bStmt\./g, 'Statement'],
+  [/\bAmt\./g, 'Amount'],
+  [/\bBal\./g, 'Balance'],
+  [/\bQty\./g, 'Quantity'],
+  [/\bDesc\./g, 'Description'],
+  [/\bDoc\./g, 'Document'],
+  [/\bPmt\./g, 'Payment'],
+  [/\bJnl\./g, 'Journal'],
+  [/\bGen\./g, 'General'],
+  [/\bCust\./g, 'Customer'],
+  [/\bVend\./g, 'Vendor'],
+  [/\bInv\./g, 'Invoice'],
+  [/\bDim\./g, 'Dimension'],
+  [/\bCurr\./g, 'Currency'],
+  [/\bExt\./g, 'External'],
+  [/\bId\b/g, 'I.D.'],
+];
+
+function expandAbbreviations(text: string): string {
+  let result = text;
+  for (const [pattern, replacement] of BC_ABBREVIATIONS) {
+    result = result.replace(pattern, replacement);
+  }
+  return result;
 }
 
 function parseDuration(output: string): number {
