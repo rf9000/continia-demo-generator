@@ -273,11 +273,16 @@ export async function playDemo(
         const fieldName = step.target?.find((t) => t.field)?.field;
         debug(`Filling field "${fieldName}" with "${step.value}"`);
 
-        // Animate cursor to the target field so viewers see which field is being edited.
-        // BC fields may be in a collapsed FastTab (0x0 rect) until DN.playRecording
-        // navigates there, so we try before AND after filling.
+        // If the field is in a collapsed FastTab, expand it first so the
+        // cursor can reach it before DN.playRecording fills the value.
+        if (fieldName) {
+          await expandFastTabForField(currentFrame, page, fieldName);
+        }
+
+        // Scroll to center and move cursor BEFORE filling the value.
         let cursorMoved = false;
         if (fieldName) {
+          await scrollFieldToCenter(currentFrame, page, fieldName);
           cursorMoved = await animateCursorToField(currentFrame, page, fieldName);
         }
 
@@ -290,21 +295,14 @@ export async function playDemo(
           return DN['playRecording'](data);
         }, singleStep as unknown);
 
-        // After DN.playRecording, BC may have scrolled the field into view but
-        // only just barely (at the edge). Try to center it in the viewport.
-        if (fieldName) {
-          await scrollFieldToCenter(currentFrame, page, fieldName);
-        }
-
-        // If the field wasn't visible before filling, animate cursor to the
-        // now-focused field so the viewer still sees where data was entered.
+        // If cursor couldn't reach the field before filling (e.g. field was
+        // only made visible by DN.playRecording), move it there now.
         if (!cursorMoved && fieldName) {
-          // Brief wait for BC to settle after filling
           await page.waitForTimeout(300);
           const postFrame = await awaitBCFrame(page, 5_000).catch(() => currentFrame);
+          await scrollFieldToCenter(postFrame, page, fieldName);
           cursorMoved = await animateCursorToField(postFrame, page, fieldName);
           if (!cursorMoved) {
-            // Last resort: animate to whatever element is currently focused
             const activeBox = await postFrame.evaluate(() => {
               const el = document.activeElement as HTMLElement | null;
               if (!el) return null;
@@ -315,11 +313,7 @@ export async function playDemo(
             if (activeBox) {
               debug(`Cursor fallback: using focused element`);
               await cursorClickAt(page, postFrame, activeBox.x, activeBox.y);
-              cursorMoved = true;
             }
-          }
-          if (!cursorMoved) {
-            debug(`Could not find field "${fieldName}" for cursor animation`);
           }
         }
       }
@@ -402,6 +396,156 @@ export async function playDemo(
  * checks if it's outside the middle ~60% of the viewport, and if so scrolls
  * its nearest scrollable ancestor to center it.
  */
+/**
+ * If a field is inside a collapsed FastTab, click the FastTab header to
+ * expand it so the field becomes visible before we try to move the cursor.
+ * BC renders FastTabs as elements with class "collapsibleTab" and a
+ * clickable header with aria-expanded that toggles the content.
+ */
+async function expandFastTabForField(frame: Frame, page: Page, fieldName: string): Promise<void> {
+  const headerToClick = await frame.evaluate((name: string) => {
+    // Find the field element — even if it has a 0x0 rect (collapsed)
+    function findFieldElement(): Element | null {
+      for (const el of document.querySelectorAll(`[aria-label*="${name}"], [title*="${name}"]`)) {
+        return el;
+      }
+      for (const el of document.querySelectorAll(
+        'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]',
+      )) {
+        if (el.getAttribute('aria-label')?.includes(name)) return el;
+      }
+      for (const cap of document.querySelectorAll(
+        'label, [class*="caption"], [class*="Caption"]',
+      )) {
+        if (cap.textContent?.trim() === name || cap.textContent?.includes(name)) {
+          return cap;
+        }
+      }
+      return null;
+    }
+
+    const field = findFieldElement();
+    if (!field) return null;
+
+    // Check if the field is already visible (not collapsed)
+    const rect = (field as HTMLElement).getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) return null;
+
+    // Walk up to find the collapsed FastTab container
+    let el: Element | null = field;
+    while (el) {
+      // Look for a FastTab header that is collapsed (aria-expanded="false")
+      const header = el.querySelector('[aria-expanded="false"]');
+      if (header) {
+        const headerRect = (header as HTMLElement).getBoundingClientRect();
+        if (headerRect.width > 0 && headerRect.height > 0) {
+          return {
+            x: headerRect.x + headerRect.width / 2,
+            y: headerRect.y + headerRect.height / 2,
+          };
+        }
+      }
+      // Also check if this element itself is a collapsed header's content
+      if (
+        el.classList?.contains('collapsibleTab') ||
+        el.classList?.contains('collapsibleTab-container')
+      ) {
+        const header =
+          el.querySelector('[aria-expanded="false"]') ??
+          el.previousElementSibling?.querySelector('[aria-expanded="false"]') ??
+          el.parentElement?.querySelector('[aria-expanded="false"]');
+        if (header) {
+          const headerRect = (header as HTMLElement).getBoundingClientRect();
+          if (headerRect.width > 0 && headerRect.height > 0) {
+            return {
+              x: headerRect.x + headerRect.width / 2,
+              y: headerRect.y + headerRect.height / 2,
+            };
+          }
+        }
+      }
+      el = el.parentElement;
+    }
+
+    return null;
+  }, fieldName);
+
+  if (headerToClick) {
+    debug(`Expanding collapsed FastTab for field "${fieldName}"`);
+    await frame.evaluate(({ x, y }) => {
+      const el = document.elementFromPoint(x, y) as HTMLElement | null;
+      el?.click();
+    }, headerToClick);
+    await page.waitForTimeout(500);
+    await awaitBCFrame(page, 10_000).catch(() => {});
+  }
+
+  // After expanding the FastTab, the field may still be hidden behind a
+  // "Show more" link. Check if the field is visible; if not, find and
+  // click "Show more" within the same FastTab.
+  const showMoreToClick = await frame.evaluate((name: string) => {
+    function findFieldElement(): Element | null {
+      for (const el of document.querySelectorAll(`[aria-label*="${name}"], [title*="${name}"]`)) {
+        return el;
+      }
+      for (const el of document.querySelectorAll(
+        'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]',
+      )) {
+        if (el.getAttribute('aria-label')?.includes(name)) return el;
+      }
+      for (const cap of document.querySelectorAll(
+        'label, [class*="caption"], [class*="Caption"]',
+      )) {
+        if (cap.textContent?.trim() === name || cap.textContent?.includes(name)) return cap;
+      }
+      return null;
+    }
+
+    const field = findFieldElement();
+    if (!field) return null;
+
+    const rect = (field as HTMLElement).getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) return null; // already visible
+
+    // Walk up to find the FastTab container, then look for "Show more" inside it
+    let container: Element | null = field;
+    while (container) {
+      if (
+        container.classList?.contains('collapsibleTab') ||
+        container.classList?.contains('collapsibleTab-container') ||
+        container.getAttribute('role') === 'tabpanel' ||
+        container.getAttribute('role') === 'group'
+      ) {
+        break;
+      }
+      container = container.parentElement;
+    }
+
+    // Search for "Show more" link — in the FastTab container if found, otherwise the whole document
+    const scope = container ?? document;
+    for (const el of scope.querySelectorAll('a, button, [role="button"], [role="link"], span')) {
+      const text = (el as HTMLElement).innerText?.trim().toLowerCase();
+      if (text === 'show more' || text === 'vis mere' || text === 'mehr anzeigen') {
+        const r = (el as HTMLElement).getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) {
+          return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+        }
+      }
+    }
+    return null;
+  }, fieldName);
+
+  if (showMoreToClick) {
+    debug(`Clicking "Show more" for field "${fieldName}"`);
+    await frame.evaluate(({ x, y }) => {
+      const el = document.elementFromPoint(x, y) as HTMLElement | null;
+      el?.click();
+    }, showMoreToClick);
+    await page.waitForTimeout(500);
+    await awaitBCFrame(page, 10_000).catch(() => {});
+  }
+}
+
 async function scrollFieldToCenter(frame: Frame, page: Page, fieldName: string): Promise<void> {
   const viewportHeight = 1080;
   const comfortZoneTop = viewportHeight * 0.25;
