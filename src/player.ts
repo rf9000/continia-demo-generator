@@ -1,5 +1,5 @@
 import { chromium, type Page, type Frame } from 'playwright';
-import { readFileSync, copyFileSync, mkdirSync } from 'fs';
+import { readFileSync, copyFileSync, writeFileSync, mkdirSync } from 'fs';
 import { parse as parseYaml } from 'yaml';
 import { resolve, parse as parsePath } from 'path';
 import { DemoConfig } from './config.js';
@@ -26,17 +26,33 @@ export interface RecordingStep {
   description?: string;
 }
 
+export interface StepTimingEntry {
+  stepIndex: number;
+  startMs: number;
+  endMs: number;
+}
+
+export interface StepTimingMetadata {
+  trimStartMs: number;
+  steps: StepTimingEntry[];
+}
+
 export interface PlayResult {
   success: boolean;
   videoPath?: string;
+  timing?: StepTimingMetadata;
   error?: string;
+}
+
+export interface PlayOptions {
+  stepDelays?: Map<number, number>;
 }
 
 const NAV_DELAY_MS = 2000;
 const END_DELAY_MS = 3000;
 const NAV_TIMEOUT_MS = 120_000;
 
-export async function playDemo(specPath: string, config: DemoConfig): Promise<PlayResult> {
+export async function playDemo(specPath: string, config: DemoConfig, options?: PlayOptions): Promise<PlayResult> {
   const absoluteSpecPath = resolve(specPath);
   const specContent = readFileSync(absoluteSpecPath, 'utf-8');
   const recording: Recording = parseYaml(specContent);
@@ -60,11 +76,13 @@ export async function playDemo(specPath: string, config: DemoConfig): Promise<Pl
     recordVideo: { dir: outputDir, size: { width: 1440, height: 900 } },
   });
   const page = await context.newPage();
+  let timing: StepTimingMetadata | undefined;
 
   try {
     // Navigate to BC
     console.log(`Navigating to: ${bcUrl.toString()}`);
     await page.goto(bcUrl.toString());
+    const videoStartMs = Date.now();
 
     // Authenticate
     if (config.bcAuth === 'UserPassword' && config.bcUsernameKey && config.bcPasswordKey) {
@@ -85,7 +103,10 @@ export async function playDemo(specPath: string, config: DemoConfig): Promise<Pl
     console.log('Waiting for BC to load...');
     await page.waitForTimeout(200); // Same 200ms delay as bc-replay
     const frame = await awaitBCFrame(page);
+    const authCompleteMs = Date.now();
     console.log('BC is ready');
+
+    const timingSteps: StepTimingEntry[] = [];
 
     // Log step info
     for (let i = 0; i < recording.steps.length; i++) {
@@ -142,6 +163,7 @@ export async function playDemo(specPath: string, config: DemoConfig): Promise<Pl
     // Execute each step using Playwright clicks with delays
     for (let i = 0; i < recording.steps.length; i++) {
       const step = recording.steps[i];
+      const stepStartMs = Date.now() - videoStartMs;
       console.log(`\nStep ${i + 1}/${recording.steps.length}: [${step.type}] ${step.description ?? step.caption ?? ''}`);
 
       const currentFrame = await awaitBCFrame(page, 10_000).catch(() => frame);
@@ -188,13 +210,26 @@ export async function playDemo(specPath: string, config: DemoConfig): Promise<Pl
         console.log('  (page still loading after step...)');
       }
 
-      // Delay between steps so video captures the UI state
-      await page.waitForTimeout(NAV_DELAY_MS);
+      // Delay between steps — use dynamic delay if provided, otherwise default
+      const delay = options?.stepDelays?.get(i) ?? NAV_DELAY_MS;
+      await page.waitForTimeout(delay);
+
+      const stepEndMs = Date.now() - videoStartMs;
+      timingSteps.push({ stepIndex: i, startMs: stepStartMs, endMs: stepEndMs });
     }
 
     // Final delay so the video captures the end state
     console.log('Recording complete, capturing final state...');
     await page.waitForTimeout(END_DELAY_MS);
+
+    // Build timing metadata
+    const trimStartMs = Math.max(0, (authCompleteMs - videoStartMs) - 1000);
+    timing = { trimStartMs, steps: timingSteps };
+
+    // Save timing JSON for --skip-record reuse
+    const timingPath = resolve(outputDir, `${specName}.timing.json`);
+    writeFileSync(timingPath, JSON.stringify(timing, null, 2));
+    console.log(`Timing saved: ${timingPath}`);
 
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -218,7 +253,7 @@ export async function playDemo(specPath: string, config: DemoConfig): Promise<Pl
     const finalPath = resolve(outputDir, `${specName}.webm`);
     copyFileSync(videoPath, finalPath);
     console.log(`Video saved: ${finalPath}`);
-    return { success: true, videoPath: finalPath };
+    return { success: true, videoPath: finalPath, timing };
   }
 
   return { success: false, error: 'No video was recorded' };

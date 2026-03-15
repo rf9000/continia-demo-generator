@@ -1,6 +1,8 @@
 import OpenAI from 'openai';
+import { execSync } from 'child_process';
 import { writeFileSync, mkdirSync } from 'fs';
 import { resolve, dirname } from 'path';
+import { createRequire } from 'module';
 
 export interface NarrationResult {
   success: boolean;
@@ -49,5 +51,46 @@ export async function generateNarration(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { success: false, error: `TTS generation failed: ${message}` };
+  }
+}
+
+/**
+ * Probes an audio file's duration in milliseconds using FFmpeg.
+ */
+export async function getAudioDuration(audioPath: string): Promise<number> {
+  const ffmpeg = getFFmpegPath();
+  const absPath = resolve(audioPath);
+
+  // FFmpeg prints duration to stderr even when it "fails" (no output specified).
+  // We intentionally omit an output to just probe the input.
+  try {
+    execSync(`"${ffmpeg}" -i "${absPath}" 2>&1`, { encoding: 'utf-8', stdio: 'pipe' });
+    return 0; // Won't reach here — FFmpeg always exits non-zero without output
+  } catch (error: unknown) {
+    const output = (error as { stdout?: string }).stdout
+      ?? (error as { stderr?: string }).stderr
+      ?? '';
+    return parseDuration(output);
+  }
+}
+
+function parseDuration(output: string): number {
+  const match = output.match(/Duration:\s*(\d+):(\d+):(\d+)\.(\d+)/);
+  if (!match) throw new Error('Could not parse audio duration from FFmpeg output');
+  const [, hours, minutes, seconds, centiseconds] = match;
+  return (
+    parseInt(hours, 10) * 3600_000 +
+    parseInt(minutes, 10) * 60_000 +
+    parseInt(seconds, 10) * 1000 +
+    parseInt(centiseconds.padEnd(3, '0').slice(0, 3), 10)
+  );
+}
+
+function getFFmpegPath(): string {
+  const require = createRequire(import.meta.url);
+  try {
+    return require('ffmpeg-static') as string;
+  } catch {
+    return 'ffmpeg';
   }
 }
