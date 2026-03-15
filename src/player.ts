@@ -195,7 +195,8 @@ export async function playDemo(
     // Execute each step using Playwright clicks with delays
     for (let i = 0; i < recording.steps.length; i++) {
       const step = recording.steps[i];
-      const stepStartMs = Date.now() - videoStartMs;
+      const stepStartTime = Date.now();
+      const stepStartMs = stepStartTime - videoStartMs;
       console.log(
         `\nStep ${i + 1}/${recording.steps.length}: [${step.type}] ${step.description ?? step.caption ?? ''}`,
       );
@@ -293,8 +294,8 @@ export async function playDemo(
         }, singleStep as unknown);
       }
 
-      // Wait for any navigation/rendering triggered by the click
-      await page.waitForTimeout(1500);
+      // Wait for BC to respond to the click, then wait until idle
+      await page.waitForTimeout(500);
       try {
         const postFrame = await awaitBCFrame(page, 15_000);
         // Log what's on the page after this step
@@ -311,9 +312,16 @@ export async function playDemo(
         console.log('  (page still loading after step...)');
       }
 
-      // Delay between steps — use dynamic delay if provided, otherwise default
+      // Overlap narration delay with BC load time — only wait the remainder
       const delay = options?.stepDelays?.get(i) ?? NAV_DELAY_MS;
-      await page.waitForTimeout(delay);
+      const elapsed = Date.now() - stepStartTime;
+      const remaining = Math.max(0, delay - elapsed);
+      if (remaining > 0) {
+        await page.waitForTimeout(remaining);
+      }
+      console.log(
+        `  Step timing: ${elapsed}ms elapsed (BC load), ${remaining}ms extra wait, ${delay}ms target`,
+      );
 
       const stepEndMs = Date.now() - videoStartMs;
       timingSteps.push({ stepIndex: i, startMs: stepStartMs, endMs: stepEndMs });
