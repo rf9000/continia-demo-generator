@@ -273,52 +273,12 @@ export async function playDemo(
         const fieldName = step.target?.find((t) => t.field)?.field;
         debug(`Filling field "${fieldName}" with "${step.value}"`);
 
-        // Animate cursor to the target field so viewers can see which field is being filled
+        // Animate cursor to the target field so viewers see which field is being edited.
+        // BC fields may be in a collapsed FastTab (0x0 rect) until DN.playRecording
+        // navigates there, so we try before AND after filling.
+        let cursorMoved = false;
         if (fieldName) {
-          const fieldBox = await currentFrame.evaluate((name: string) => {
-            // BC renders field captions as <label> or as a preceding element with the field name
-            // Try finding an input/textarea whose associated label or aria-label matches
-            const inputs = document.querySelectorAll(
-              'input, textarea, select, [contenteditable="true"]',
-            );
-            for (const input of inputs) {
-              const el = input as HTMLElement;
-              // Check aria-label
-              if (el.getAttribute('aria-label')?.includes(name)) {
-                const rect = el.getBoundingClientRect();
-                return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-              }
-              // Check associated label via 'for' attribute
-              const id = el.getAttribute('id');
-              if (id) {
-                const label = document.querySelector(`label[for="${id}"]`);
-                if (label && label.textContent?.includes(name)) {
-                  const rect = el.getBoundingClientRect();
-                  return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-                }
-              }
-            }
-            // Fallback: find a label/caption with the field name and target its adjacent control
-            const allLabels = document.querySelectorAll(
-              'label, .ms-nav-band-header, [class*="caption"]',
-            );
-            for (const label of allLabels) {
-              if (label.textContent?.trim() === name || label.textContent?.includes(name)) {
-                const control =
-                  label.nextElementSibling?.querySelector('input, textarea, select') ??
-                  label.parentElement?.querySelector('input, textarea, select');
-                if (control) {
-                  const rect = (control as HTMLElement).getBoundingClientRect();
-                  return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-                }
-              }
-            }
-            return null;
-          }, fieldName);
-
-          if (fieldBox) {
-            await cursorClickAt(page, currentFrame, fieldBox.x, fieldBox.y);
-          }
+          cursorMoved = await animateCursorToField(currentFrame, page, fieldName);
         }
 
         const singleStep = { ...recording, steps: [step] };
@@ -329,6 +289,39 @@ export async function playDemo(
           >;
           return DN['playRecording'](data);
         }, singleStep as unknown);
+
+        // After DN.playRecording, BC may have scrolled the field into view but
+        // only just barely (at the edge). Try to center it in the viewport.
+        if (fieldName) {
+          await scrollFieldToCenter(currentFrame, page, fieldName);
+        }
+
+        // If the field wasn't visible before filling, animate cursor to the
+        // now-focused field so the viewer still sees where data was entered.
+        if (!cursorMoved && fieldName) {
+          // Brief wait for BC to settle after filling
+          await page.waitForTimeout(300);
+          const postFrame = await awaitBCFrame(page, 5_000).catch(() => currentFrame);
+          cursorMoved = await animateCursorToField(postFrame, page, fieldName);
+          if (!cursorMoved) {
+            // Last resort: animate to whatever element is currently focused
+            const activeBox = await postFrame.evaluate(() => {
+              const el = document.activeElement as HTMLElement | null;
+              if (!el) return null;
+              const rect = el.getBoundingClientRect();
+              if (rect.width === 0 && rect.height === 0) return null;
+              return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+            });
+            if (activeBox) {
+              debug(`Cursor fallback: using focused element`);
+              await cursorClickAt(page, postFrame, activeBox.x, activeBox.y);
+              cursorMoved = true;
+            }
+          }
+          if (!cursorMoved) {
+            debug(`Could not find field "${fieldName}" for cursor animation`);
+          }
+        }
       }
 
       // Wait for BC to respond to the click, then wait until idle
@@ -401,6 +394,150 @@ export async function playDemo(
   }
 
   return { success: false, error: 'No video was recorded' };
+}
+
+/**
+ * After BC navigates to a field (e.g. via DN.playRecording), the field may be
+ * barely in view at the edge of the viewport. This function finds the field,
+ * checks if it's outside the middle ~60% of the viewport, and if so scrolls
+ * its nearest scrollable ancestor to center it.
+ */
+async function scrollFieldToCenter(frame: Frame, page: Page, fieldName: string): Promise<void> {
+  const viewportHeight = 1080;
+  const comfortZoneTop = viewportHeight * 0.25;
+  const comfortZoneBottom = viewportHeight * 0.75;
+
+  const result = await frame.evaluate(
+    ({ name, zoneTop, zoneBottom }) => {
+      // Find the field element
+      function findField(): Element | null {
+        for (const el of document.querySelectorAll(`[aria-label*="${name}"]`)) {
+          const r = (el as HTMLElement).getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) return el;
+        }
+        for (const el of document.querySelectorAll(`[title*="${name}"]`)) {
+          const r = (el as HTMLElement).getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) return el;
+        }
+        for (const el of document.querySelectorAll(
+          'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]',
+        )) {
+          if (el.getAttribute('aria-label')?.includes(name)) {
+            const r = (el as HTMLElement).getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) return el;
+          }
+        }
+        return null;
+      }
+
+      const el = findField();
+      if (!el) return null;
+
+      const elRect = (el as HTMLElement).getBoundingClientRect();
+      const elCenterY = elRect.top + elRect.height / 2;
+
+      // Already in the comfort zone — no scroll needed
+      if (elCenterY >= zoneTop && elCenterY <= zoneBottom) {
+        return { scrolled: false, fieldY: Math.round(elCenterY) };
+      }
+
+      // Walk up to find the nearest scrollable ancestor
+      let scrollParent: Element | null = el.parentElement;
+      while (scrollParent) {
+        const style = window.getComputedStyle(scrollParent);
+        if (
+          (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
+          scrollParent.scrollHeight > scrollParent.clientHeight
+        ) {
+          break;
+        }
+        scrollParent = scrollParent.parentElement;
+      }
+
+      if (!scrollParent) return { scrolled: false, fieldY: Math.round(elCenterY) };
+
+      // Scroll so the field ends up at the vertical center of the container
+      const parentRect = scrollParent.getBoundingClientRect();
+      const elCenterInContainer =
+        elRect.top - parentRect.top + scrollParent.scrollTop + elRect.height / 2;
+      const targetScrollTop = elCenterInContainer - scrollParent.clientHeight / 2;
+      scrollParent.scrollTo({ top: targetScrollTop, behavior: 'smooth' });
+
+      return { scrolled: true, fieldY: Math.round(elCenterY) };
+    },
+    { name: fieldName, zoneTop: comfortZoneTop, zoneBottom: comfortZoneBottom },
+  );
+
+  if (result?.scrolled) {
+    debug(`Scroll-to-center: field "${fieldName}" was at y=${result.fieldY}, centering...`);
+    await page.waitForTimeout(500);
+  }
+}
+
+/**
+ * Tries to find a BC field by name and animate the cursor to it.
+ * Returns true if the cursor was moved, false if the field wasn't found or visible.
+ */
+async function animateCursorToField(frame: Frame, page: Page, fieldName: string): Promise<boolean> {
+  const fieldBox = await frame.evaluate((name: string) => {
+    function center(el: Element) {
+      const rect = (el as HTMLElement).getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) return null;
+      return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    }
+
+    // Strategy 1: Any element with matching aria-label
+    for (const el of document.querySelectorAll(`[aria-label*="${name}"]`)) {
+      const c = center(el);
+      if (c) return c;
+    }
+
+    // Strategy 2: Element with matching title attribute
+    for (const el of document.querySelectorAll(`[title*="${name}"]`)) {
+      const c = center(el);
+      if (c) return c;
+    }
+
+    // Strategy 3: Standard inputs + role="textbox" / role="combobox"
+    for (const el of document.querySelectorAll(
+      'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]',
+    )) {
+      if (el.getAttribute('aria-label')?.includes(name)) {
+        const c = center(el);
+        if (c) return c;
+      }
+    }
+
+    // Strategy 4: Find caption text, target its sibling value element
+    for (const cap of document.querySelectorAll('label, [class*="caption"], [class*="Caption"]')) {
+      if (cap.textContent?.trim() === name || cap.textContent?.includes(name)) {
+        const parent = cap.parentElement;
+        if (parent) {
+          const ctrl = parent.querySelector(
+            'input, textarea, select, [role="textbox"], [role="combobox"], [contenteditable="true"]',
+          );
+          if (ctrl) {
+            const c = center(ctrl);
+            if (c) return c;
+          }
+          const sibling = cap.nextElementSibling;
+          if (sibling) {
+            const c = center(sibling);
+            if (c) return c;
+          }
+        }
+      }
+    }
+
+    return null;
+  }, fieldName);
+
+  if (fieldBox) {
+    debug(`Cursor -> field "${fieldName}" at (${fieldBox.x}, ${fieldBox.y})`);
+    await cursorClickAt(page, frame, fieldBox.x, fieldBox.y);
+    return true;
+  }
+  return false;
 }
 
 /**
