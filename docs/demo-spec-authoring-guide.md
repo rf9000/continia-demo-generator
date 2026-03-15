@@ -101,14 +101,22 @@ For clicking toolbar buttons, menu items, and actions visible on the current pag
 For opening a record from a list page. Do NOT use `caption: Edit` — BC list pages don't always show an Edit button. Instead, use `row`:
 
 ```yaml
+# By position (1-indexed)
 - type: action
   target:
     - page: Bank Acc. Reconciliation List
   row: 1
   description: Open the first reconciliation
+
+# By text match (preferred when the row content is known)
+- type: action
+  target:
+    - page: General Journal Batches
+  row: "PMT JNL"
+  description: Select the PMT JNL batch
 ```
 
-`row: 1` clicks the first data row in the list grid (1-indexed). The player finds the data table in BC's grid and clicks the first link in that row, which navigates to the card/detail page.
+`row: 1` clicks the first data row (1-indexed). `row: "PMT JNL"` scans all rows and clicks the first one containing that text in any cell. **Prefer text matching** when the target row has a known name — it's resilient to data ordering changes.
 
 ### Action: Open a Dropdown Menu, Then Click a Sub-Action
 
@@ -133,6 +141,26 @@ If an action lives inside a dropdown/submenu, you need **two separate steps**: o
 **Common parent menus in BC:** `Page`, `Process`, `Report`, `Navigate`, `More options`
 
 To discover the menu structure: open the page in BC, look at the action bar, and note which actions are top-level vs inside dropdown menus.
+
+### Action: Click Assist Edit on a Field
+
+For clicking the "..." (assist edit) button on a field to open a lookup/modal dialog. This is common for fields like "Batch Name", "Bank Account No.", etc. that open a selection page when the dots are clicked.
+
+```yaml
+- type: action
+  target:
+    - page: Payment Journal
+  caption: Batch Name
+  assistEdit: true
+  description: Click assist edit on Batch Name to open batch selection
+```
+
+**`caption`** is the field label (not a button caption). The player will:
+1. Locate the field by its caption label
+2. Click the field value to give it focus (reveals the "..." button)
+3. Click the assist-edit "..." button
+
+**When to use this vs `type: input`:** Use `assistEdit` when the goal is to open a lookup/selection dialog. Use `type: input` when the goal is to type a value directly into the field.
 
 ### Input: Fill a Field
 
@@ -276,6 +304,7 @@ demo:
 
 - [ ] `start.pageId` is set to the correct numeric page ID
 - [ ] All `caption` values match the **exact visible button text** on the target environment
+- [ ] Assist-edit steps use `assistEdit: true` with the **field label** as caption
 - [ ] Actions inside dropdown menus have **two steps** (open menu + click item)
 - [ ] List row navigation uses `row: N`, not `caption: Edit`
 - [ ] `stepNarration` indices match the actual step positions (0-based, counting every step)

@@ -23,9 +23,10 @@ export interface RecordingStep {
   type: string;
   target: Array<{ page?: string; field?: string }>;
   caption?: string;
-  row?: number;
+  row?: number | string;
   value?: string;
   description?: string;
+  assistEdit?: boolean;
 }
 
 export interface StepTimingEntry {
@@ -193,7 +194,10 @@ export async function playDemo(
 
       const currentFrame = await awaitBCFrame(page, 10_000).catch(() => frame);
 
-      if (step.type === 'action' && step.row) {
+      if (step.type === 'action' && step.assistEdit && step.caption) {
+        // Click the assist-edit "..." button on a field
+        await clickAssistEdit(currentFrame, page, step.caption);
+      } else if (step.type === 'action' && step.row) {
         // Click on a specific row in the list grid
         await clickBCRow(currentFrame, step.row, page);
       } else if (step.type === 'action' && step.caption) {
@@ -685,19 +689,187 @@ async function animateCursorToField(frame: Frame, page: Page, fieldName: string)
 }
 
 /**
+ * Clicks the assist-edit "..." button on a BC field.  The workflow:
+ * 1. Locate the field by its caption label (reuses field-finding strategies).
+ * 2. Click the field value cell so BC reveals the assist-edit dots.
+ * 3. Find and click the "..." button that appeared next to the value.
+ */
+async function clickAssistEdit(frame: Frame, page: Page, fieldCaption: string): Promise<void> {
+  debug(`Assist-edit: locating field "${fieldCaption}"...`);
+
+  // Expand FastTab / Show More if the field is hidden
+  await expandFastTabForField(frame, page, fieldCaption);
+  await scrollFieldToCenter(frame, page, fieldCaption);
+
+  // Step 1: Find the field value element and click it to give it focus.
+  // This makes BC render the assist-edit button.
+  const fieldBox = await frame.evaluate((name: string) => {
+    function center(el: Element) {
+      const rect = (el as HTMLElement).getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) return null;
+      return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    }
+
+    // Strategy 1: aria-label or title match → prefer input/control elements
+    for (const el of document.querySelectorAll(
+      `input[aria-label*="${name}"], [role="textbox"][aria-label*="${name}"], [role="combobox"][aria-label*="${name}"]`,
+    )) {
+      const c = center(el);
+      if (c) return c;
+    }
+
+    // Strategy 2: Any element with matching aria-label
+    for (const el of document.querySelectorAll(`[aria-label*="${name}"]`)) {
+      const c = center(el);
+      if (c) return c;
+    }
+
+    // Strategy 3: Caption label → sibling value element
+    for (const cap of document.querySelectorAll('label, [class*="caption"], [class*="Caption"]')) {
+      if (cap.textContent?.trim() === name || cap.textContent?.includes(name)) {
+        const parent = cap.parentElement;
+        if (parent) {
+          const ctrl = parent.querySelector(
+            'input, textarea, select, [role="textbox"], [role="combobox"], [contenteditable="true"]',
+          );
+          if (ctrl) {
+            const c = center(ctrl);
+            if (c) return c;
+          }
+          const sibling = cap.nextElementSibling;
+          if (sibling) {
+            const c = center(sibling);
+            if (c) return c;
+          }
+        }
+      }
+    }
+
+    return null;
+  }, fieldCaption);
+
+  if (!fieldBox) {
+    info(`  WARNING: Assist-edit — could not find field "${fieldCaption}"`);
+    return;
+  }
+
+  // Animate cursor to field and click to give it focus
+  debug(`Assist-edit: clicking field value at (${fieldBox.x}, ${fieldBox.y})`);
+  await cursorClickAt(page, frame, fieldBox.x, fieldBox.y);
+  await frame.evaluate(({ x, y }) => {
+    const el = document.elementFromPoint(x, y) as HTMLElement | null;
+    el?.click();
+  }, fieldBox);
+  await page.waitForTimeout(600);
+
+  // Step 2: Now find and click the assist-edit "..." button.
+  // BC renders it as an <a> with class "icon-MoreEllipsis ms-nav-lookupbutton-embedded"
+  // and aria-label "Choose a value for <FieldName>".  No visible text — icon only.
+  const assistBtn = await frame.evaluate((name: string) => {
+    function center(el: Element) {
+      const rect = (el as HTMLElement).getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) return null;
+      return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    }
+
+    // Strategy 1: Element with aria-label "Choose a value for <FieldName>"
+    for (const el of document.querySelectorAll(
+      `[aria-label*="Choose a value for ${name}"], [aria-label*="choose a value for ${name}"]`,
+    )) {
+      const c = center(el);
+      if (c) return c;
+    }
+
+    // Strategy 2: Lookup button class near a field matching the name
+    for (const el of document.querySelectorAll(`[aria-label*="${name}"]`)) {
+      const parent = el.parentElement;
+      if (!parent) continue;
+      for (const sib of parent.querySelectorAll(
+        '[class*="lookupbutton"], [class*="MoreEllipsis"]',
+      )) {
+        const c = center(sib);
+        if (c) return c;
+      }
+    }
+
+    // Strategy 3: Any visible lookup button near the active element
+    const active = document.activeElement as HTMLElement | null;
+    if (active) {
+      const parent = active.parentElement;
+      if (parent) {
+        for (const sib of parent.querySelectorAll(
+          '[class*="lookupbutton"], [class*="MoreEllipsis"], [role="button"]',
+        )) {
+          if (sib === active) continue;
+          const ariaLabel = sib.getAttribute('aria-label')?.toLowerCase() ?? '';
+          const title = sib.getAttribute('title')?.toLowerCase() ?? '';
+          if (
+            ariaLabel.includes('choose a value') ||
+            title.includes('choose a value') ||
+            sib.classList.contains('icon-MoreEllipsis') ||
+            sib.className?.toString().includes('lookupbutton')
+          ) {
+            const c = center(sib);
+            if (c) return c;
+          }
+        }
+      }
+    }
+
+    return null;
+  }, fieldCaption);
+
+  if (assistBtn) {
+    debug(`Assist-edit: clicking "..." button at (${assistBtn.x}, ${assistBtn.y})`);
+    await cursorClickAt(page, frame, assistBtn.x, assistBtn.y);
+    await frame.evaluate(({ x, y }) => {
+      const el = document.elementFromPoint(x, y) as HTMLElement | null;
+      el?.click();
+    }, assistBtn);
+  } else {
+    info(`  WARNING: Assist-edit — could not find "..." button for "${fieldCaption}"`);
+    // Fallback: try keyboard shortcut (F6 or Ctrl+F6 opens assist edit in some BC versions)
+    debug('Assist-edit: trying F6 keyboard fallback');
+    await page.keyboard.press('F6');
+  }
+}
+
+/**
  * Clicks on a specific row in a BC list grid. BC renders lists as
  * grids with role="grid" containing role="row" elements. The first
  * clickable cell (usually a link) in the data row opens the record.
+ *
+ * When a modal dialog is open, searches within the dialog first.
  */
-async function clickBCRow(frame: Frame, rowNumber: number, page?: Page): Promise<void> {
-  debug(`Clicking row ${rowNumber} in list grid...`);
+async function clickBCRow(frame: Frame, rowTarget: number | string, page?: Page): Promise<void> {
+  debug(
+    `Clicking row ${typeof rowTarget === 'string' ? `"${rowTarget}"` : rowTarget} in list grid...`,
+  );
 
-  // Animate cursor to the first link in the target data row
+  // Animate cursor to the target row
   if (page) {
-    const rowBox = await frame.evaluate((targetRow: number) => {
-      // Find data rows, skipping headers (rows with <th> or columnheader)
+    const rowBox = await frame.evaluate((target: number | string) => {
+      // Prefer the topmost modal dialog that contains a data grid
+      function getScope(): Element {
+        const dialogs = document.querySelectorAll(
+          '[role="dialog"], [class*="ms-nav-popup"], [class*="modal-dialog"]',
+        );
+        for (let i = dialogs.length - 1; i >= 0; i--) {
+          const d = dialogs[i] as HTMLElement;
+          if (
+            d.offsetWidth > 0 &&
+            d.offsetHeight > 0 &&
+            !d.className?.includes('TeachingBubble') &&
+            d.querySelector('table, [role="grid"]')
+          )
+            return d;
+        }
+        return document.body;
+      }
+      const scope = getScope();
+
       function getDataRows(): Element[] {
-        const tables = document.querySelectorAll(
+        const tables = scope.querySelectorAll(
           'table.ms-nav-grid-data-table, table[class*="ms-nav-grid"][class*="data"]',
         );
         for (const table of tables) {
@@ -706,36 +878,72 @@ async function clickBCRow(frame: Frame, rowNumber: number, page?: Page): Promise
             (r) =>
               !r.querySelector('th') &&
               !r.querySelector('[role="columnheader"]') &&
-              r.querySelector('td'),
+              r.querySelector('td') &&
+              Array.from(r.querySelectorAll('td')).some((c) =>
+                (c as HTMLElement).textContent?.trim(),
+              ),
           );
           if (data.length > 0) return data;
         }
-        const grids = document.querySelectorAll('[role="grid"]');
+        const grids = scope.querySelectorAll('[role="grid"]');
         for (const grid of grids) {
           const rows = Array.from(grid.querySelectorAll('[role="row"]'));
-          return rows.filter((r) => !r.querySelector('[role="columnheader"]'));
+          return rows.filter(
+            (r) =>
+              !r.querySelector('[role="columnheader"]') &&
+              Array.from(r.querySelectorAll('[role="gridcell"]')).some((c) =>
+                (c as HTMLElement).textContent?.trim(),
+              ),
+          );
         }
         return [];
       }
+
       const rows = getDataRows();
-      const row = rows[targetRow - 1];
+      const row =
+        typeof target === 'number'
+          ? (rows[target - 1] ?? null)
+          : (rows.find((r) => {
+              const search = target.toLowerCase();
+              return Array.from(r.querySelectorAll('td, [role="gridcell"]')).some((c) =>
+                (c.textContent?.trim().toLowerCase() ?? '').includes(search),
+              );
+            }) ?? null);
       if (!row) return null;
 
       const link = row.querySelector('a');
       const el = link ?? row.querySelector('td') ?? row;
       const rect = (el as HTMLElement).getBoundingClientRect();
       return { x: rect.x + Math.min(rect.width * 0.3, 40), y: rect.y + rect.height / 2 };
-    }, rowNumber);
+    }, rowTarget);
 
     if (rowBox) {
       await cursorClickAt(page, frame, rowBox.x, rowBox.y);
     }
   }
 
-  // Actually click the row — same data-row filtering as cursor positioning
-  const clicked = await frame.evaluate((targetRow: number) => {
+  // Actually click the row
+  const clicked = await frame.evaluate((target: number | string) => {
+    function getScope(): Element {
+      const dialogs = document.querySelectorAll(
+        '[role="dialog"], [class*="ms-nav-popup"], [class*="modal-dialog"]',
+      );
+      for (let i = dialogs.length - 1; i >= 0; i--) {
+        const d = dialogs[i] as HTMLElement;
+        if (
+          d.offsetWidth > 0 &&
+          d.offsetHeight > 0 &&
+          !d.className?.includes('TeachingBubble') &&
+          d.querySelector('table, [role="grid"]')
+        )
+          return d;
+      }
+      return document.body;
+    }
+    const scope = getScope();
+
     function getDataRows(): Element[] {
-      const tables = document.querySelectorAll(
+      const tables = scope.querySelectorAll(
         'table.ms-nav-grid-data-table, table[class*="ms-nav-grid"][class*="data"]',
       );
       for (const table of tables) {
@@ -744,19 +952,37 @@ async function clickBCRow(frame: Frame, rowNumber: number, page?: Page): Promise
           (r) =>
             !r.querySelector('th') &&
             !r.querySelector('[role="columnheader"]') &&
-            r.querySelector('td'),
+            r.querySelector('td') &&
+            Array.from(r.querySelectorAll('td')).some((c) =>
+              (c as HTMLElement).textContent?.trim(),
+            ),
         );
         if (data.length > 0) return data;
       }
-      const grids = document.querySelectorAll('[role="grid"]');
+      const grids = scope.querySelectorAll('[role="grid"]');
       for (const grid of grids) {
         const rows = Array.from(grid.querySelectorAll('[role="row"]'));
-        return rows.filter((r) => !r.querySelector('[role="columnheader"]'));
+        return rows.filter(
+          (r) =>
+            !r.querySelector('[role="columnheader"]') &&
+            Array.from(r.querySelectorAll('[role="gridcell"]')).some((c) =>
+              (c as HTMLElement).textContent?.trim(),
+            ),
+        );
       }
       return [];
     }
+
     const rows = getDataRows();
-    const row = rows[targetRow - 1];
+    const row =
+      typeof target === 'number'
+        ? (rows[target - 1] ?? null)
+        : (rows.find((r) => {
+            const search = target.toLowerCase();
+            return Array.from(r.querySelectorAll('td, [role="gridcell"]')).some((c) =>
+              (c.textContent?.trim().toLowerCase() ?? '').includes(search),
+            );
+          }) ?? null);
     if (!row) return null;
 
     const link = row.querySelector('a');
@@ -770,12 +996,14 @@ async function clickBCRow(frame: Frame, rowNumber: number, page?: Page): Promise
       return `clicked cell: ${cell.textContent?.trim()}`;
     }
     return null;
-  }, rowNumber);
+  }, rowTarget);
 
   if (clicked) {
     debug(clicked);
   } else {
-    info(`  WARNING: Could not find data row ${rowNumber} in any grid`);
+    info(
+      `  WARNING: Could not find data row ${typeof rowTarget === 'string' ? `"${rowTarget}"` : rowTarget} in any grid`,
+    );
   }
 }
 
@@ -784,6 +1012,41 @@ async function clickBCRow(frame: Frame, rowNumber: number, page?: Page): Promise
  * Tries multiple strategies since BC renders actions as various element types.
  */
 async function clickBCAction(frame: Frame, page: Page, caption: string): Promise<boolean> {
+  // Strategy 0: If a modal dialog is open, search inside it first.
+  // BC renders dialogs after the main content, so unscoped .first() picks the wrong element.
+  const dialogLocator = frame.locator(
+    '[role="dialog"]:visible:not([class*="TeachingBubble"]), [class*="ms-nav-popup"]:visible',
+  );
+  const hasDialog = (await dialogLocator.count()) > 0;
+  if (hasDialog) {
+    const dialog = dialogLocator.last(); // topmost non-tooltip dialog
+    for (const role of ['button', 'menuitem', 'link'] as const) {
+      const loc = dialog.getByRole(role, { name: caption, exact: true });
+      if ((await loc.count()) > 0) {
+        debug(`Clicking [${role}] "${caption}" (in dialog)`);
+        await animateCursorToLocator(page, frame, loc);
+        await loc.first().click();
+        return true;
+      }
+    }
+    // Also try text match inside dialog
+    const dialogText = dialog.getByText(caption, { exact: true });
+    if ((await dialogText.count()) > 0) {
+      debug(`Clicking text "${caption}" (in dialog)`);
+      await animateCursorToLocator(page, frame, dialogText);
+      await dialogText.first().click();
+      return true;
+    }
+  }
+
+  // If this is a common dialog button (OK, Cancel, etc.) and no dialog was found above,
+  // don't fall through to the main page — the dialog was likely already closed.
+  const DIALOG_BUTTONS = ['ok', 'cancel', 'close', 'yes', 'no'];
+  if (hasDialog === false && DIALOG_BUTTONS.includes(caption.toLowerCase())) {
+    debug(`"${caption}" looks like a dialog button but no dialog is open — skipping`);
+    return true; // Return true to avoid fallback/warning — the dialog already closed
+  }
+
   // Strategy 1: Exact match button/menuitem by accessible name
   for (const role of ['button', 'menuitem', 'link'] as const) {
     const locator = frame.getByRole(role, { name: caption, exact: true });

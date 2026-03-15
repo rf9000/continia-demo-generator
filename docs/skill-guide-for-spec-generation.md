@@ -129,7 +129,7 @@ Not all groups render as submenus — some are just visual grouping. **When unsu
 
 ### Opening Records from a List: Use `row`, Not `caption: Edit`
 
-BC list pages don't have an "Edit" button. Users click the primary key field (leftmost link) to open the record.
+BC list pages don't have an "Edit" button. Users click the primary key field (leftmost link) to open the record. `row` accepts a number (1-indexed position) or a string (text to match in any cell).
 
 ```yaml
 # CORRECT — clicks the first record's primary key link
@@ -139,11 +139,43 @@ BC list pages don't have an "Edit" button. Users click the primary key field (le
   row: 1
   description: Open the first reconciliation
 
+# PREFERRED — text match is resilient to data ordering changes
+- type: action
+  target:
+    - page: General Journal Batches
+  row: "PMT JNL"
+  description: Select the PMT JNL batch
+
 # WRONG — "Edit" doesn't exist on BC list pages
 - type: action
   caption: Edit
   description: Open a reconciliation
 ```
+
+**Prefer `row: "text"` over `row: N`** when the target record has a known identifier. This makes specs resilient to demo data changes. Use `row: 1` only when you need "the first record" regardless of which one it is.
+
+### Assist Edit: Opening Field Lookups
+
+Some fields have an assist-edit button ("...") that opens a lookup/selection dialog. Use `assistEdit: true` on an action step with `caption` set to the **field label**.
+
+```yaml
+# Opens the General Journal Batches dialog from the Batch Name field
+- type: action
+  target:
+    - page: Payment Journal
+  caption: Batch Name
+  assistEdit: true
+  description: Click assist edit on Batch Name to open batch selection
+```
+
+The player will locate the field by its caption, click it to reveal the "..." button, and click the assist-edit button. The subsequent steps interact with the opened dialog — use `row` and `caption` as normal to select records and confirm.
+
+**When the dialog auto-closes on row selection**, the OK step is automatically skipped (safe to include it for dialogs that require explicit confirmation).
+
+**How the skill should determine when to use `assistEdit`:**
+- In AL, look for fields with `TableRelation` or `Lookup` trigger — these typically have assist-edit
+- Fields that open a selection page (e.g., Batch Name, Bank Account No.) need `assistEdit: true`
+- Regular text/number fields that you just type into use `type: input` instead
 
 ### Input Fields: Use the Field Caption
 
@@ -293,7 +325,8 @@ Before outputting a spec, verify:
 - [ ] Every caption matches the AL `Caption` property exactly (including ellipsis, spacing)
 - [ ] Actions inside `area(Navigation)` or `area(Processing)` have a preceding tab-click step
 - [ ] Nested groups that render as submenus have their own click step
-- [ ] List page navigation uses `row: 1`, not `caption: Edit`
+- [ ] List page navigation uses `row: "text"` (preferred) or `row: N`, not `caption: Edit`
+- [ ] Fields with lookups/TableRelation use `assistEdit: true`, not `type: input`
 - [ ] `stepNarration` has an entry for every step index (0-based), with brief text for UI steps and detailed text for feature steps
 - [ ] Narration text reads naturally when spoken aloud — no code artifacts, no markup
 - [ ] `prerequisites` lists all data/state the environment must have
