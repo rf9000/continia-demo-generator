@@ -3,6 +3,7 @@ import { execSync } from 'child_process';
 import { writeFileSync, mkdirSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { createRequire } from 'module';
+import { debug } from './log.js';
 
 export interface NarrationResult {
   success: boolean;
@@ -33,9 +34,7 @@ export async function generateNarration(
   const openai = new OpenAI({ apiKey });
 
   try {
-    console.log(
-      `Generating narration (${text.length} chars, voice: ${options?.voice ?? 'nova'})...`,
-    );
+    debug(`Generating narration (${text.length} chars, voice: ${options?.voice ?? 'nova'})...`);
 
     const expandedText = expandAbbreviations(text);
 
@@ -49,7 +48,7 @@ export async function generateNarration(
 
     const buffer = Buffer.from(await response.arrayBuffer());
     writeFileSync(absolutePath, buffer);
-    console.log(`Narration saved: ${absolutePath} (${(buffer.length / 1024).toFixed(0)} KB)`);
+    debug(`Narration saved: ${absolutePath} (${(buffer.length / 1024).toFixed(0)} KB)`);
 
     return { success: true, audioPath: absolutePath };
   } catch (error) {
@@ -100,7 +99,7 @@ const BC_ABBREVIATIONS: [RegExp, string][] = [
   [/\bId\b/g, 'I.D.'],
 ];
 
-function expandAbbreviations(text: string): string {
+export function expandAbbreviations(text: string): string {
   let result = text;
   for (const [pattern, replacement] of BC_ABBREVIATIONS) {
     result = result.replace(pattern, replacement);
@@ -108,7 +107,7 @@ function expandAbbreviations(text: string): string {
   return result;
 }
 
-function parseDuration(output: string): number {
+export function parseDuration(output: string): number {
   const match = output.match(/Duration:\s*(\d+):(\d+):(\d+)\.(\d+)/);
   if (!match) throw new Error('Could not parse audio duration from FFmpeg output');
   const [, hours, minutes, seconds, centiseconds] = match;

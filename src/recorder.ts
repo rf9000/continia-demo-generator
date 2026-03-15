@@ -2,6 +2,7 @@ import { resolve, parse } from 'path';
 import { existsSync } from 'fs';
 import { DemoConfig } from './config.js';
 import { playDemo, type PlayResult, type PlayOptions, type StepTimingMetadata } from './player.js';
+import { info, debug } from './log.js';
 
 export interface RecordResult {
   success: boolean;
@@ -22,15 +23,20 @@ export async function recordDemo(
     return { success: false, error: `Spec file not found: ${absoluteSpecPath}` };
   }
 
-  console.log(`Recording demo: ${specName}`);
-  console.log(`BC URL: ${config.bcStartAddress}`);
-  console.log(`Spec: ${absoluteSpecPath}`);
+  info(`Demo: ${specName}`);
+  info(`BC: ${config.bcStartAddress}`);
+  debug(`Spec: ${absoluteSpecPath}`);
 
-  const result: PlayResult = await playDemo(absoluteSpecPath, config, options);
+  try {
+    const result: PlayResult = await playDemo(absoluteSpecPath, config, options);
 
-  if (result.success) {
-    return { success: true, videoPath: result.videoPath, timing: result.timing };
-  } else {
-    return { success: false, error: result.error };
+    if (result.success) {
+      return { success: true, videoPath: result.videoPath, timing: result.timing };
+    } else {
+      return { success: false, error: result.error };
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { success: false, error: message };
   }
 }

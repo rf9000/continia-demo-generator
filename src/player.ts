@@ -4,6 +4,7 @@ import { parse as parseYaml } from 'yaml';
 import { resolve, parse as parsePath } from 'path';
 import { DemoConfig } from './config.js';
 import { injectCursor, cursorClickLocator, cursorClickAt, animateCursorTo } from './cursor.js';
+import { info, debug, cleanDescription } from './log.js';
 
 export interface Recording {
   description: string;
@@ -78,7 +79,7 @@ export async function playDemo(
   const browser = await chromium.launch({ headless: !config.headed });
 
   // --- Phase A: Authenticate in a non-recording context ---
-  console.log(`Navigating to: ${bcUrl.toString()}`);
+  debug(`Navigating to: ${bcUrl.toString()}`);
   const authContext = await browser.newContext({ viewport: { width: 1920, height: 1080 } });
   const authPage = await authContext.newPage();
 
@@ -88,7 +89,7 @@ export async function playDemo(
     const username = process.env[config.bcUsernameKey];
     const password = process.env[config.bcPasswordKey] ?? '';
     if (username) {
-      console.log(`Authenticating as: ${username}`);
+      info(`Auth: ${username} (UserPassword)`);
       await authPage.fill('input[name=UserName]', username);
       await authPage.fill('input[name=Password]', password);
       await Promise.all([
@@ -98,10 +99,10 @@ export async function playDemo(
     }
   }
 
-  console.log('Waiting for BC to load...');
+  info('Waiting for BC to load...');
   await authPage.waitForTimeout(200);
   await awaitBCFrame(authPage);
-  console.log('BC is ready — transferring session to recording context');
+  debug('BC is ready — transferring session to recording context');
 
   // Grab cookies and the authenticated URL
   const cookies = await authContext.cookies();
@@ -130,19 +131,12 @@ export async function playDemo(
     // Brief pause so the first frame of the trimmed video shows the loaded page
     await page.waitForTimeout(500);
     const trimStartMs = bcReadyMs - videoStartMs;
-    console.log(`BC loaded (trimming ${(trimStartMs / 1000).toFixed(1)}s of loading screen)`);
+    info(`BC loaded (trimming ${(trimStartMs / 1000).toFixed(1)}s of loading screen)`);
 
     const timingSteps: StepTimingEntry[] = [];
 
-    // Log step info
-    for (let i = 0; i < recording.steps.length; i++) {
-      const step = recording.steps[i];
-      console.log(`  Step ${i + 1}: [${step.type}] ${step.description ?? step.caption ?? ''}`);
-    }
-
-    // Take a snapshot to see what's on the page
+    // Take a snapshot to see what's on the page (verbose only)
     const snapshot = await frame.evaluate(() => {
-      // Collect all buttons and actions visible on the page
       const buttons: string[] = [];
       document
         .querySelectorAll('button, [role="button"], [role="menuitem"], a[tabindex]')
@@ -152,54 +146,50 @@ export async function playDemo(
         });
       return { buttons: buttons.slice(0, 30), title: document.title };
     });
-    console.log(`Page title: ${snapshot.title}`);
-    console.log(`Available buttons/actions: ${snapshot.buttons.join(' | ')}`);
+    debug(`Page title: ${snapshot.title}`);
+    debug(`Available buttons/actions: ${snapshot.buttons.join(' | ')}`);
 
-    // Debug: inspect grid/table structure
+    // Debug: inspect grid/table structure (verbose only)
     const gridInfo = await frame.evaluate(() => {
-      const info: string[] = [];
-      // Check for grids
+      const items: string[] = [];
       document.querySelectorAll('[role="grid"]').forEach((g, gi) => {
-        info.push(
+        items.push(
           `grid[${gi}]: ${(g as HTMLElement).getAttribute('aria-label') || g.className.slice(0, 50)}`,
         );
         const rows = g.querySelectorAll('[role="row"]');
-        info.push(`  rows: ${rows.length}`);
+        items.push(`  rows: ${rows.length}`);
         rows.forEach((r, ri) => {
           if (ri < 3) {
             const cells = r.querySelectorAll('[role="gridcell"], [role="columnheader"]');
             const texts = Array.from(cells)
               .map((c) => (c as HTMLElement).innerText?.trim().slice(0, 30))
               .filter(Boolean);
-            info.push(`  row[${ri}]: ${texts.join(' | ')}`);
+            items.push(`  row[${ri}]: ${texts.join(' | ')}`);
           }
         });
       });
-      // Check for tables
       document.querySelectorAll('table').forEach((t, ti) => {
-        info.push(`table[${ti}]: rows=${t.rows.length}, class=${t.className.slice(0, 50)}`);
+        items.push(`table[${ti}]: rows=${t.rows.length}, class=${t.className.slice(0, 50)}`);
       });
-      // Check for any clickable links in the main content area
       const links = document.querySelectorAll('a[href], a[tabindex]');
       const linkTexts: string[] = [];
       links.forEach((l) => {
         const text = (l as HTMLElement).innerText?.trim();
         if (text && text.length < 60 && text.length > 0) linkTexts.push(text);
       });
-      if (linkTexts.length) info.push(`links: ${linkTexts.slice(0, 20).join(' | ')}`);
-      return info;
+      if (linkTexts.length) items.push(`links: ${linkTexts.slice(0, 20).join(' | ')}`);
+      return items;
     });
-    console.log('DOM structure:');
-    gridInfo.forEach((line) => console.log(`  ${line}`));
+    debug('DOM structure:');
+    gridInfo.forEach((line) => debug(`  ${line}`));
 
     // Execute each step using Playwright clicks with delays
     for (let i = 0; i < recording.steps.length; i++) {
       const step = recording.steps[i];
       const stepStartTime = Date.now();
       const stepStartMs = stepStartTime - videoStartMs;
-      console.log(
-        `\nStep ${i + 1}/${recording.steps.length}: [${step.type}] ${step.description ?? step.caption ?? ''}`,
-      );
+      const stepDesc = cleanDescription(step.description ?? step.caption ?? '');
+      info(`[${i + 1}/${recording.steps.length}] ${stepDesc}`);
 
       const currentFrame = await awaitBCFrame(page, 10_000).catch(() => frame);
 
@@ -214,7 +204,7 @@ export async function playDemo(
         if (!clicked && i > 0) {
           const prevStep = recording.steps[i - 1];
           if (prevStep.type === 'action' && prevStep.caption) {
-            console.log(`  Re-opening menu "${prevStep.caption}" and retrying...`);
+            debug(`Re-opening menu "${prevStep.caption}" and retrying...`);
             await clickBCAction(currentFrame, page, prevStep.caption);
             await page.waitForTimeout(500); // Wait for dropdown to render
 
@@ -262,16 +252,14 @@ export async function playDemo(
               }
               return [...new Set(results)].slice(0, 30);
             });
-            console.log(`  DOM elements with "show/more/column": ${allText.join('\n    ')}`);
+            debug(`DOM elements with "show/more/column": ${allText.join('\n    ')}`);
 
             clicked = await clickBCAction(currentFrame, page, step.caption);
           }
         }
 
         if (!clicked) {
-          console.log(
-            `  WARNING: Could not find "${step.caption}" — falling back to DN.playRecording`,
-          );
+          info(`  WARNING: Could not find "${step.caption}" — falling back to DN.playRecording`);
           const singleStep = { ...recording, steps: [step] };
           await currentFrame.evaluate((data) => {
             const DN = (window as unknown as Record<string, unknown>)['DN'] as Record<
@@ -283,7 +271,56 @@ export async function playDemo(
         }
       } else if (step.type === 'input' && step.value) {
         const fieldName = step.target?.find((t) => t.field)?.field;
-        console.log(`  Filling field "${fieldName}" with "${step.value}"`);
+        debug(`Filling field "${fieldName}" with "${step.value}"`);
+
+        // Animate cursor to the target field so viewers can see which field is being filled
+        if (fieldName) {
+          const fieldBox = await currentFrame.evaluate((name: string) => {
+            // BC renders field captions as <label> or as a preceding element with the field name
+            // Try finding an input/textarea whose associated label or aria-label matches
+            const inputs = document.querySelectorAll(
+              'input, textarea, select, [contenteditable="true"]',
+            );
+            for (const input of inputs) {
+              const el = input as HTMLElement;
+              // Check aria-label
+              if (el.getAttribute('aria-label')?.includes(name)) {
+                const rect = el.getBoundingClientRect();
+                return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+              }
+              // Check associated label via 'for' attribute
+              const id = el.getAttribute('id');
+              if (id) {
+                const label = document.querySelector(`label[for="${id}"]`);
+                if (label && label.textContent?.includes(name)) {
+                  const rect = el.getBoundingClientRect();
+                  return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+                }
+              }
+            }
+            // Fallback: find a label/caption with the field name and target its adjacent control
+            const allLabels = document.querySelectorAll(
+              'label, .ms-nav-band-header, [class*="caption"]',
+            );
+            for (const label of allLabels) {
+              if (label.textContent?.trim() === name || label.textContent?.includes(name)) {
+                const control =
+                  label.nextElementSibling?.querySelector('input, textarea, select') ??
+                  label.parentElement?.querySelector('input, textarea, select');
+                if (control) {
+                  const rect = (control as HTMLElement).getBoundingClientRect();
+                  return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+                }
+              }
+            }
+            return null;
+          }, fieldName);
+
+          if (fieldBox) {
+            await cursorClickAt(page, currentFrame, fieldBox.x, fieldBox.y);
+          }
+        }
+
         const singleStep = { ...recording, steps: [step] };
         await currentFrame.evaluate((data) => {
           const DN = (window as unknown as Record<string, unknown>)['DN'] as Record<
@@ -307,9 +344,9 @@ export async function playDemo(
           });
           return btns.slice(0, 25);
         });
-        console.log(`  After step — buttons: ${postSnap.join(' | ')}`);
+        debug(`After step — buttons: ${postSnap.join(' | ')}`);
       } catch {
-        console.log('  (page still loading after step...)');
+        debug('(page still loading after step...)');
       }
 
       // Overlap narration delay with BC load time — only wait the remainder
@@ -319,8 +356,8 @@ export async function playDemo(
       if (remaining > 0) {
         await page.waitForTimeout(remaining);
       }
-      console.log(
-        `  Step timing: ${elapsed}ms elapsed (BC load), ${remaining}ms extra wait, ${delay}ms target`,
+      debug(
+        `Step timing: ${elapsed}ms elapsed (BC load), ${remaining}ms extra wait, ${delay}ms target`,
       );
 
       const stepEndMs = Date.now() - videoStartMs;
@@ -328,7 +365,7 @@ export async function playDemo(
     }
 
     // Final delay so the video captures the end state
-    console.log('Recording complete, capturing final state...');
+    debug('Recording complete, capturing final state...');
     await page.waitForTimeout(END_DELAY_MS);
 
     // Build timing metadata — trim the "Getting Ready" loading screen
@@ -337,7 +374,7 @@ export async function playDemo(
     // Save timing JSON for --skip-record reuse
     const timingPath = resolve(outputDir, `${specName}.timing.json`);
     writeFileSync(timingPath, JSON.stringify(timing, null, 2));
-    console.log(`Timing saved: ${timingPath}`);
+    debug(`Timing saved: ${timingPath}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`Player error: ${message}`);
@@ -359,7 +396,7 @@ export async function playDemo(
   if (videoPath) {
     const finalPath = resolve(outputDir, `${specName}.webm`);
     copyFileSync(videoPath, finalPath);
-    console.log(`Video saved: ${finalPath}`);
+    info(`Video saved: ${parsePath(finalPath).base}`);
     return { success: true, videoPath: finalPath, timing };
   }
 
@@ -372,7 +409,7 @@ export async function playDemo(
  * clickable cell (usually a link) in the data row opens the record.
  */
 async function clickBCRow(frame: Frame, rowNumber: number, page?: Page): Promise<void> {
-  console.log(`  Clicking row ${rowNumber} in list grid...`);
+  debug(`Clicking row ${rowNumber} in list grid...`);
 
   // Animate cursor to the first link in the target data row
   if (page) {
@@ -455,9 +492,9 @@ async function clickBCRow(frame: Frame, rowNumber: number, page?: Page): Promise
   }, rowNumber);
 
   if (clicked) {
-    console.log(`  ${clicked}`);
+    debug(clicked);
   } else {
-    console.log(`  WARNING: Could not find data row ${rowNumber} in any grid`);
+    info(`  WARNING: Could not find data row ${rowNumber} in any grid`);
   }
 }
 
@@ -470,7 +507,7 @@ async function clickBCAction(frame: Frame, page: Page, caption: string): Promise
   for (const role of ['button', 'menuitem', 'link'] as const) {
     const locator = frame.getByRole(role, { name: caption, exact: true });
     if ((await locator.count()) > 0) {
-      console.log(`  Clicking [${role}] "${caption}"`);
+      debug(`Clicking [${role}] "${caption}"`);
       await animateCursorToLocator(page, frame, locator);
       await locator.first().click();
       return true;
@@ -481,7 +518,7 @@ async function clickBCAction(frame: Frame, page: Page, caption: string): Promise
   for (const role of ['button', 'menuitem', 'link'] as const) {
     const locator = frame.getByRole(role, { name: caption });
     if ((await locator.count()) > 0) {
-      console.log(`  Clicking [${role}] containing "${caption}" (partial match)`);
+      debug(`Clicking [${role}] containing "${caption}" (partial match)`);
       await animateCursorToLocator(page, frame, locator);
       await locator.first().click();
       return true;
@@ -493,7 +530,7 @@ async function clickBCAction(frame: Frame, page: Page, caption: string): Promise
     `button:has-text("${caption}"), [role="button"]:has-text("${caption}"), [role="menuitem"]:has-text("${caption}"), a:has-text("${caption}"), span:has-text("${caption}")`,
   );
   if ((await textLocator.count()) > 0) {
-    console.log(`  Clicking element containing text "${caption}"`);
+    debug(`Clicking element containing text "${caption}"`);
     await animateCursorToLocator(page, frame, textLocator);
     await textLocator.first().click();
     return true;
@@ -502,7 +539,7 @@ async function clickBCAction(frame: Frame, page: Page, caption: string): Promise
   // Strategy 4: getByText — finds any visible text match in the frame
   const byText = frame.getByText(caption, { exact: true });
   if ((await byText.count()) > 0) {
-    console.log(`  Clicking text "${caption}" (getByText)`);
+    debug(`Clicking text "${caption}" (getByText)`);
     await animateCursorToLocator(page, frame, byText);
     await byText.first().click();
     return true;
@@ -513,13 +550,13 @@ async function clickBCAction(frame: Frame, page: Page, caption: string): Promise
     `button:has-text("${caption}"), [role="button"]:has-text("${caption}")`,
   );
   if ((await pageLocator.count()) > 0) {
-    console.log(`  Clicking top-bar element "${caption}"`);
+    debug(`Clicking top-bar element "${caption}"`);
     await cursorClickLocator(page, pageLocator);
     await pageLocator.first().click();
     return true;
   }
 
-  console.log(`  Could not find "${caption}" in any strategy`);
+  debug(`Could not find "${caption}" in any strategy`);
   return false;
 }
 

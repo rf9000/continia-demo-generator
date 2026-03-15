@@ -4,6 +4,7 @@ import { resolve, dirname, join } from 'path';
 import { createRequire } from 'module';
 import type { StepAudioClip } from './step-audio.js';
 import type { StepTimingMetadata } from './player.js';
+import { info, debug } from './log.js';
 
 function getFFmpegPath(): string {
   // Use ffmpeg-static (bundled full FFmpeg)
@@ -67,11 +68,11 @@ export async function composeVideo(
     `"${absOutput}"`,
   ].join(' ');
 
-  console.log(`Composing video + narration → ${absOutput}`);
+  info('Composing final video...');
 
   try {
     execSync(cmd, { stdio: 'pipe', timeout: 60_000 });
-    console.log(`Composed video saved: ${absOutput}`);
+    debug(`Composed video saved: ${absOutput}`);
     return { success: true, videoPath: absOutput };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -151,8 +152,8 @@ export async function composeWithStepAudio(options: StepComposeOptions): Promise
     cmdParts.push(`"${absOutput}"`);
 
     const cmd = cmdParts.join(' ');
-    console.log(`FFmpeg cmd: ${cmd}`);
-    console.log(`Composing final video → ${absOutput}`);
+    debug(`FFmpeg cmd: ${cmd}`);
+    info('Composing final video...');
 
     try {
       execSync(cmd, { stdio: 'pipe', timeout: 120_000 });
@@ -161,7 +162,7 @@ export async function composeWithStepAudio(options: StepComposeOptions): Promise
       console.error('FFmpeg stderr:', stderr.slice(-500));
       throw e;
     }
-    console.log(`Composed video saved: ${absOutput}`);
+    debug(`Composed video saved: ${absOutput}`);
 
     return { success: true, videoPath: absOutput };
   } catch (error) {
@@ -237,5 +238,5 @@ async function buildCombinedAudio(
     timeout: 30_000,
   });
 
-  console.log(`Combined audio track: ${concatEntries.length} segments`);
+  info(`Audio: ${concatEntries.length} segments`);
 }

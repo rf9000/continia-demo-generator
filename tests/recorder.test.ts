@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { resolve, join } from 'path';
-import { recordDemo } from './recorder.js';
+import { recordDemo } from '../src/recorder.js';
 
 const tmpDir = resolve('./test-tmp');
 
@@ -28,7 +28,7 @@ describe('recordDemo execution', () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  test('returns error when BC is unreachable', async () => {
+  test('returns error when BC is unreachable', { timeout: 30_000 }, async () => {
     const specFile = join(tmpDir, 'test-spec.yml');
     writeFileSync(
       specFile,
@@ -36,7 +36,7 @@ describe('recordDemo execution', () => {
     );
 
     const result = await recordDemo(specFile, {
-      bcStartAddress: 'http://localhost:1/bc/',
+      bcStartAddress: 'http://localhost:19222/bc/',
       bcAuth: 'Windows',
       outputDir: join(tmpDir, 'output'),
       headed: false,

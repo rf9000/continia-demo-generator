@@ -1,6 +1,6 @@
 import { config as loadEnv } from 'dotenv';
 
-loadEnv();
+loadEnv({ quiet: true });
 
 export interface DemoConfig {
   bcStartAddress: string;

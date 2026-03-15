@@ -2,6 +2,7 @@ import { resolve, join } from 'path';
 import { mkdirSync } from 'fs';
 import { generateNarration, getAudioDuration } from './narrator.js';
 import type { VoiceConfig } from './locale-voices.js';
+import { info } from './log.js';
 
 export interface StepAudioClip {
   stepIndex: number;
@@ -38,7 +39,7 @@ export async function generateStepAudio(
     .filter((e) => !isNaN(e.stepIndex) && e.text.length > 0)
     .sort((a, b) => a.stepIndex - b.stepIndex);
 
-  console.log(`Generating ${entries.length} step narration clips...`);
+  info(`Generating ${entries.length} clips (voice: ${voice.voice})...`);
 
   // Generate clips with concurrency limit
   const clips: StepAudioClip[] = [];
@@ -75,7 +76,9 @@ export async function generateStepAudio(
   for (const clip of clips) {
     const delay = Math.max(clip.durationMs + AUDIO_BUFFER_MS, MIN_STEP_DELAY_MS);
     stepDelays.set(clip.stepIndex, delay);
-    console.log(`  Step ${clip.stepIndex}: ${clip.durationMs}ms audio → ${delay}ms delay`);
+    info(
+      `Step ${clip.stepIndex}: ${(clip.durationMs / 1000).toFixed(1)}s audio -> ${(delay / 1000).toFixed(1)}s delay`,
+    );
   }
 
   return { clips, stepDelays };

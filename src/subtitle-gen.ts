@@ -2,6 +2,7 @@ import { writeFileSync } from 'fs';
 import { resolve } from 'path';
 import type { StepAudioClip } from './step-audio.js';
 import type { StepTimingMetadata } from './player.js';
+import { info } from './log.js';
 
 const FADE_IN_MS = 300;
 const FADE_OUT_MS = 400;
@@ -62,12 +63,12 @@ export function generateSubtitles(
 
   writeFileSync(assPath, assLines.join('\n'), 'utf-8');
   writeFileSync(srtPath, srtLines.join('\n'), 'utf-8');
-  console.log(`Subtitles saved: ${assPath} (${srtIndex - 1} entries, with fade effects)`);
+  info(`Subtitles: ${srtIndex - 1} entries (ASS with fade effects)`);
   return assPath;
 }
 
 // ASS time format: H:MM:SS.cc (centiseconds)
-function formatAssTime(ms: number): string {
+export function formatAssTime(ms: number): string {
   const hours = Math.floor(ms / 3600_000);
   const minutes = Math.floor((ms % 3600_000) / 60_000);
   const seconds = Math.floor((ms % 60_000) / 1000);
@@ -76,7 +77,7 @@ function formatAssTime(ms: number): string {
 }
 
 // SRT time format: HH:MM:SS,mmm
-function formatSrtTime(ms: number): string {
+export function formatSrtTime(ms: number): string {
   const hours = Math.floor(ms / 3600_000);
   const minutes = Math.floor((ms % 3600_000) / 60_000);
   const seconds = Math.floor((ms % 60_000) / 1000);
@@ -92,7 +93,7 @@ function pad3(n: number): string {
   return String(n).padStart(3, '0');
 }
 
-function wrapText(text: string, maxLineLength: number): string {
+export function wrapText(text: string, maxLineLength: number): string {
   const words = text.split(' ');
   const lines: string[] = [];
   let currentLine = '';

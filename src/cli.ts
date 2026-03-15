@@ -11,6 +11,7 @@ import { composeVideo, composeWithStepAudio } from './composer.js';
 import { generateStepAudio } from './step-audio.js';
 import { generateSubtitles } from './subtitle-gen.js';
 import { getVoiceForLocale, type VoiceConfig } from './locale-voices.js';
+import { setVerbose, header, info } from './log.js';
 import type { StepTimingMetadata } from './player.js';
 
 const program = new Command();
@@ -31,6 +32,7 @@ program
   .option('--skip-record', 'Skip recording, only generate narration and compose')
   .option('--no-subs', 'Skip subtitle generation and burn-in')
   .option('--no-trim', 'Keep login/auth in the video (debugging)')
+  .option('-v, --verbose', 'Show detailed debug output')
   .action(
     async (
       spec: string,
@@ -44,8 +46,10 @@ program
         skipRecord?: boolean;
         subs?: boolean;
         trim?: boolean;
+        verbose?: boolean;
       },
     ) => {
+      setVerbose(options.verbose ?? false);
       const specPath = resolve(spec);
 
       if (!existsSync(specPath)) {
@@ -66,7 +70,12 @@ program
       });
 
       const specName = parsePath(specPath).name;
-      const outputDir = resolve(config.outputDir);
+      const outputDir = resolve(config.outputDir, specName);
+
+      // Point config.outputDir at the spec-specific subfolder so the player
+      // writes video / timing there instead of the top-level output dir.
+      config.outputDir = outputDir;
+
       const videoPath = resolve(outputDir, `${specName}.webm`);
       const finalPath = resolve(outputDir, `${specName}.mp4`);
       const srtPath = resolve(outputDir, `${specName}.srt`);
@@ -88,7 +97,8 @@ program
         voiceConfig = getVoiceForLocale(locale);
       }
 
-      console.log('=== Continia Demo Generator ===\n');
+      console.log('Continia Demo Generator');
+      info(`Spec: ${specName}`);
 
       // Determine pipeline: per-step narration (preferred) or single narration (fallback)
       const useStepNarration =
@@ -101,19 +111,17 @@ program
       let stepAudioPlan: Awaited<ReturnType<typeof generateStepAudio>> | undefined;
 
       if (useStepNarration && !options.skipRecord) {
-        console.log('--- Step Narration ---\n');
+        header('Narration');
         stepAudioPlan = await generateStepAudio(stepNarration!, specName, outputDir, voiceConfig);
-        console.log(`\nGenerated ${stepAudioPlan.clips.length} audio clips\n`);
       }
 
       // --- Phase B: Record video ---
       if (!options.skipRecord) {
-        console.log('--- Recording ---\n');
+        header('Recording');
         const result = await recordDemo(specPath, config, {
           stepDelays: stepAudioPlan?.stepDelays,
         });
         if (result.success) {
-          console.log(`\nVideo recorded: ${result.videoPath}`);
           timing = result.timing;
         } else {
           console.error(`\nFailed to record: ${result.error}`);
@@ -125,24 +133,23 @@ program
           console.error(`Error: --skip-record but no video found at ${videoPath}`);
           process.exit(1);
         }
-        console.log(`Using existing video: ${videoPath}`);
+        info(`Using existing video: ${videoPath}`);
 
         if (existsSync(timingJsonPath)) {
           timing = JSON.parse(readFileSync(timingJsonPath, 'utf-8')) as StepTimingMetadata;
-          console.log(`Loaded timing from: ${timingJsonPath}`);
+          info(`Loaded timing from: ${timingJsonPath}`);
         }
 
         // Generate step audio if needed (may not have been generated before)
         if (useStepNarration && !stepAudioPlan) {
-          console.log('\n--- Step Narration ---\n');
+          header('Narration');
           stepAudioPlan = await generateStepAudio(stepNarration!, specName, outputDir, voiceConfig);
         }
       }
 
       // --- Phase C: Compose with narration ---
       if (useStepNarration && stepAudioPlan && timing) {
-        // Per-step narration pipeline
-        console.log('\n--- Composing (per-step narration) ---\n');
+        header('Composing');
 
         // Generate subtitles
         let subtitlePath: string | undefined;
@@ -160,14 +167,13 @@ program
         });
 
         if (compResult.success) {
-          console.log(`\nFinal video: ${compResult.videoPath}`);
+          info(`Saved: ${parsePath(compResult.videoPath!).base}`);
         } else {
           console.error(`\nFailed to compose: ${compResult.error}`);
           process.exit(1);
         }
       } else if (useSingleNarration) {
-        // Fallback: single narration (no step sync)
-        console.log('\n--- Narration (single track) ---\n');
+        header('Narration (single track)');
         const audioPath = resolve(outputDir, `${specName}.mp3`);
         const narResult = await generateNarration(narrationText!.trim(), audioPath, {
           voice: voiceConfig.voice,
@@ -178,10 +184,10 @@ program
           process.exit(1);
         }
 
-        console.log('\n--- Composing ---\n');
+        header('Composing');
         const compResult = await composeVideo(videoPath, audioPath, finalPath);
         if (compResult.success) {
-          console.log(`\nFinal video: ${compResult.videoPath}`);
+          info(`Saved: ${parsePath(compResult.videoPath!).base}`);
         } else {
           console.error(`\nFailed to compose: ${compResult.error}`);
           process.exit(1);
