@@ -118,11 +118,15 @@ export async function playDemo(specPath: string, config: DemoConfig, options?: P
     await page.goto(authenticatedUrl);
     const videoStartMs = Date.now();
 
-    // Wait for BC to be ready in the recording context
+    // Wait for BC to be ready in the recording context (skips "Getting Ready" screen)
     await page.waitForTimeout(200);
     const frame = await awaitBCFrame(page);
+    const bcReadyMs = Date.now();
     await injectCursor(page);
-    console.log('Recording started on BC page');
+    // Brief pause so the first frame of the trimmed video shows the loaded page
+    await page.waitForTimeout(500);
+    const trimStartMs = (bcReadyMs - videoStartMs);
+    console.log(`BC loaded (trimming ${(trimStartMs / 1000).toFixed(1)}s of loading screen)`);
 
     const timingSteps: StepTimingEntry[] = [];
 
@@ -277,8 +281,8 @@ export async function playDemo(specPath: string, config: DemoConfig, options?: P
     console.log('Recording complete, capturing final state...');
     await page.waitForTimeout(END_DELAY_MS);
 
-    // Build timing metadata — no trim needed since recording starts after auth
-    timing = { trimStartMs: 0, steps: timingSteps };
+    // Build timing metadata — trim the "Getting Ready" loading screen
+    timing = { trimStartMs, steps: timingSteps };
 
     // Save timing JSON for --skip-record reuse
     const timingPath = resolve(outputDir, `${specName}.timing.json`);
