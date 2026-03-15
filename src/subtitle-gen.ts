@@ -6,6 +6,7 @@ import { info } from './log.js';
 
 const FADE_IN_MS = 300;
 const FADE_OUT_MS = 400;
+const MAX_WORDS_PER_CHUNK = 12;
 
 /**
  * Generates an ASS subtitle file with fade-in/fade-out effects.
@@ -44,21 +45,32 @@ export function generateSubtitles(
     if (!stepTiming) continue;
 
     const startMs = Math.max(0, stepTiming.startMs - timing.trimStartMs);
-    const endMs = startMs + clip.durationMs;
+    const chunks = splitIntoChunks(clip.text, MAX_WORDS_PER_CHUNK);
+    const totalWords = clip.text.split(/\s+/).length;
 
-    // ASS entry with fade effect
-    const text = clip.text.replace(/\n/g, '\\N');
-    const wrapped = wrapText(text, 70).replace(/\n/g, '\\N');
-    assLines.push(
-      `Dialogue: 0,${formatAssTime(startMs)},${formatAssTime(endMs)},Default,,0,0,0,,{\\fad(${FADE_IN_MS},${FADE_OUT_MS})}${wrapped}`,
-    );
+    // Distribute chunks across the clip duration proportional to word count
+    let offsetMs = 0;
+    for (const chunk of chunks) {
+      const chunkWords = chunk.split(/\s+/).length;
+      const chunkDurationMs = Math.round((chunkWords / totalWords) * clip.durationMs);
+      const chunkStartMs = startMs + offsetMs;
+      const chunkEndMs = chunkStartMs + chunkDurationMs;
 
-    // SRT entry (plain, no effects)
-    srtLines.push(String(srtIndex));
-    srtLines.push(`${formatSrtTime(startMs)} --> ${formatSrtTime(endMs)}`);
-    srtLines.push(wrapText(clip.text, 60));
-    srtLines.push('');
-    srtIndex++;
+      // ASS entry with fade effect
+      const wrapped = wrapText(chunk.replace(/\n/g, '\\N'), 70).replace(/\n/g, '\\N');
+      assLines.push(
+        `Dialogue: 0,${formatAssTime(chunkStartMs)},${formatAssTime(chunkEndMs)},Default,,0,0,0,,{\\fad(${FADE_IN_MS},${FADE_OUT_MS})}${wrapped}`,
+      );
+
+      // SRT entry (plain, no effects)
+      srtLines.push(String(srtIndex));
+      srtLines.push(`${formatSrtTime(chunkStartMs)} --> ${formatSrtTime(chunkEndMs)}`);
+      srtLines.push(wrapText(chunk, 60));
+      srtLines.push('');
+      srtIndex++;
+
+      offsetMs += chunkDurationMs;
+    }
   }
 
   writeFileSync(assPath, assLines.join('\n'), 'utf-8');
@@ -91,6 +103,55 @@ function pad(n: number): string {
 
 function pad3(n: number): string {
   return String(n).padStart(3, '0');
+}
+
+/**
+ * Splits text into chunks of roughly maxWords words each, breaking at
+ * sentence boundaries when possible so subtitles read naturally.
+ */
+function splitIntoChunks(text: string, maxWords: number): string[] {
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length <= maxWords) return [text.trim()];
+
+  // Split into sentences first, then merge small sentences / split large ones
+  const sentences = text.match(/[^.!?]+[.!?]+/g) ?? [text];
+  const chunks: string[] = [];
+  let current: string[] = [];
+  let currentWordCount = 0;
+
+  for (const sentence of sentences) {
+    const sentenceWords = sentence.trim().split(/\s+/);
+
+    // If adding this sentence stays within limit, accumulate
+    if (currentWordCount + sentenceWords.length <= maxWords) {
+      current.push(sentence.trim());
+      currentWordCount += sentenceWords.length;
+      continue;
+    }
+
+    // Flush current accumulator if non-empty
+    if (current.length > 0) {
+      chunks.push(current.join(' '));
+      current = [];
+      currentWordCount = 0;
+    }
+
+    // If this sentence itself exceeds maxWords, split it by word count
+    if (sentenceWords.length > maxWords) {
+      for (let i = 0; i < sentenceWords.length; i += maxWords) {
+        chunks.push(sentenceWords.slice(i, i + maxWords).join(' '));
+      }
+    } else {
+      current.push(sentence.trim());
+      currentWordCount = sentenceWords.length;
+    }
+  }
+
+  if (current.length > 0) {
+    chunks.push(current.join(' '));
+  }
+
+  return chunks;
 }
 
 export function wrapText(text: string, maxLineLength: number): string {
