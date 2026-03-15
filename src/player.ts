@@ -79,7 +79,7 @@ export async function playDemo(
 
   // --- Phase A: Authenticate in a non-recording context ---
   console.log(`Navigating to: ${bcUrl.toString()}`);
-  const authContext = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const authContext = await browser.newContext({ viewport: { width: 1920, height: 1080 } });
   const authPage = await authContext.newPage();
 
   await authPage.goto(bcUrl.toString());
@@ -110,8 +110,8 @@ export async function playDemo(
 
   // --- Phase B: Record in a fresh context with video enabled ---
   const context = await browser.newContext({
-    viewport: { width: 1440, height: 900 },
-    recordVideo: { dir: outputDir, size: { width: 1440, height: 900 } },
+    viewport: { width: 1920, height: 1080 },
+    recordVideo: { dir: outputDir, size: { width: 1920, height: 1080 } },
   });
   await context.addCookies(cookies);
   const page = await context.newPage();
