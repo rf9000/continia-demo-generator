@@ -20,7 +20,7 @@ export async function generateNarration(
   options?: {
     voice?: 'alloy' | 'echo' | 'fable' | 'onyx' | 'nova' | 'shimmer';
     speed?: number;
-  }
+  },
 ): Promise<NarrationResult> {
   const apiKey = process.env['OPENAI_API_KEY'];
   if (!apiKey) {
@@ -33,7 +33,9 @@ export async function generateNarration(
   const openai = new OpenAI({ apiKey });
 
   try {
-    console.log(`Generating narration (${text.length} chars, voice: ${options?.voice ?? 'nova'})...`);
+    console.log(
+      `Generating narration (${text.length} chars, voice: ${options?.voice ?? 'nova'})...`,
+    );
 
     const expandedText = expandAbbreviations(text);
 
@@ -69,9 +71,8 @@ export async function getAudioDuration(audioPath: string): Promise<number> {
     execSync(`"${ffmpeg}" -i "${absPath}" 2>&1`, { encoding: 'utf-8', stdio: 'pipe' });
     return 0; // Won't reach here — FFmpeg always exits non-zero without output
   } catch (error: unknown) {
-    const output = (error as { stdout?: string }).stdout
-      ?? (error as { stderr?: string }).stderr
-      ?? '';
+    const output =
+      (error as { stdout?: string }).stdout ?? (error as { stderr?: string }).stderr ?? '';
     return parseDuration(output);
   }
 }

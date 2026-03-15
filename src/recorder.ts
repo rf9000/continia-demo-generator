@@ -10,7 +10,11 @@ export interface RecordResult {
   error?: string;
 }
 
-export async function recordDemo(specPath: string, config: DemoConfig, options?: PlayOptions): Promise<RecordResult> {
+export async function recordDemo(
+  specPath: string,
+  config: DemoConfig,
+  options?: PlayOptions,
+): Promise<RecordResult> {
   const absoluteSpecPath = resolve(specPath);
   const specName = parse(absoluteSpecPath).name;
 

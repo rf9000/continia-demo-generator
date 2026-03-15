@@ -30,7 +30,10 @@ describe('recordDemo execution', () => {
 
   test('returns error when BC is unreachable', async () => {
     const specFile = join(tmpDir, 'test-spec.yml');
-    writeFileSync(specFile, 'description: test\nsteps:\n  - type: action\n    target:\n      - page: Test\n    caption: OK');
+    writeFileSync(
+      specFile,
+      'description: test\nsteps:\n  - type: action\n    target:\n      - page: Test\n    caption: OK',
+    );
 
     const result = await recordDemo(specFile, {
       bcStartAddress: 'http://localhost:1/bc/',

@@ -58,12 +58,12 @@ export async function composeVideo(
     `"${ffmpeg}"`,
     `-i "${absVideo}"`,
     `-i "${absAudio}"`,
-    `-c:v libx264`,     // Re-encode video to H.264 for MP4 compatibility
-    `-c:a aac`,         // Encode audio as AAC
-    `-b:a 192k`,        // Audio bitrate
-    `-map 0:v:0`,       // Video from first input
-    `-map 1:a:0`,       // Audio from second input
-    `-y`,               // Overwrite output
+    `-c:v libx264`, // Re-encode video to H.264 for MP4 compatibility
+    `-c:a aac`, // Encode audio as AAC
+    `-b:a 192k`, // Audio bitrate
+    `-map 0:v:0`, // Video from first input
+    `-map 1:a:0`, // Audio from second input
+    `-y`, // Overwrite output
     `"${absOutput}"`,
   ].join(' ');
 
@@ -169,7 +169,11 @@ export async function composeWithStepAudio(options: StepComposeOptions): Promise
     return { success: false, error: `Composition failed: ${message}` };
   } finally {
     // Clean up temp files
-    try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    try {
+      rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -190,7 +194,7 @@ async function buildCombinedAudio(
   let currentTimeMs = 0;
 
   for (const clip of sortedClips) {
-    const stepTiming = timing.steps.find(s => s.stepIndex === clip.stepIndex);
+    const stepTiming = timing.steps.find((s) => s.stepIndex === clip.stepIndex);
     if (!stepTiming) continue;
 
     // When this clip should start in the trimmed timeline
@@ -198,13 +202,14 @@ async function buildCombinedAudio(
 
     // Generate silence to fill the gap before this clip
     const silenceDurationMs = clipStartMs - currentTimeMs;
-    if (silenceDurationMs > 50) { // Skip trivial gaps
+    if (silenceDurationMs > 50) {
+      // Skip trivial gaps
       const silencePath = join(tmpDir, `silence-${clip.stepIndex}.mp3`);
       const silenceSec = (silenceDurationMs / 1000).toFixed(3);
       // Match TTS sample rate (24000 Hz mono) so concat timing stays in sync
       execSync(
         `"${ffmpeg}" -f lavfi -i anullsrc=r=24000:cl=mono -t ${silenceSec} -c:a libmp3lame -q:a 9 "${silencePath}"`,
-        { stdio: 'pipe', timeout: 10_000 }
+        { stdio: 'pipe', timeout: 10_000 },
       );
       concatEntries.push(`file '${silencePath.replace(/\\/g, '/')}'`);
     }
@@ -218,7 +223,7 @@ async function buildCombinedAudio(
     // No clips — generate a short silence as placeholder
     execSync(
       `"${ffmpeg}" -f lavfi -i anullsrc=r=24000:cl=mono -t 1 -c:a libmp3lame -q:a 9 "${outputPath}"`,
-      { stdio: 'pipe', timeout: 10_000 }
+      { stdio: 'pipe', timeout: 10_000 },
     );
     return;
   }
@@ -227,10 +232,10 @@ async function buildCombinedAudio(
   const concatListPath = join(tmpDir, 'concat-list.txt');
   writeFileSync(concatListPath, concatEntries.join('\n'), 'utf-8');
 
-  execSync(
-    `"${ffmpeg}" -f concat -safe 0 -i "${concatListPath}" -c copy "${outputPath}"`,
-    { stdio: 'pipe', timeout: 30_000 }
-  );
+  execSync(`"${ffmpeg}" -f concat -safe 0 -i "${concatListPath}" -c copy "${outputPath}"`, {
+    stdio: 'pipe',
+    timeout: 30_000,
+  });
 
   console.log(`Combined audio track: ${concatEntries.length} segments`);
 }

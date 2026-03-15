@@ -65,6 +65,6 @@ describe('loadConfig', () => {
 
     expect(config.bcStartAddress).toBe('http://custom/bc/');
     expect(config.bcAuth).toBe('UserPassword'); // from env
-    expect(config.outputDir).toBe('./output');   // from default
+    expect(config.outputDir).toBe('./output'); // from default
   });
 });

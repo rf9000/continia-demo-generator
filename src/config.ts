@@ -1,5 +1,4 @@
 import { config as loadEnv } from 'dotenv';
-import { resolve } from 'path';
 
 loadEnv();
 
@@ -14,7 +13,8 @@ export interface DemoConfig {
 
 export function loadConfig(overrides?: Partial<DemoConfig>): DemoConfig {
   return {
-    bcStartAddress: overrides?.bcStartAddress ?? process.env['BC_START_ADDRESS'] ?? 'http://localhost:8080/bc/',
+    bcStartAddress:
+      overrides?.bcStartAddress ?? process.env['BC_START_ADDRESS'] ?? 'http://localhost:8080/bc/',
     bcAuth: (overrides?.bcAuth ?? process.env['BC_AUTH'] ?? 'Windows') as DemoConfig['bcAuth'],
     bcUsernameKey: overrides?.bcUsernameKey ?? process.env['BC_USERNAME_KEY'],
     bcPasswordKey: overrides?.bcPasswordKey ?? process.env['BC_PASSWORD_KEY'],

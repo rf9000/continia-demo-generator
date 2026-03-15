@@ -8,18 +8,19 @@ const CLICK_EFFECT_DURATION_MS = 400;
  * above everything (including iframes) so it's always visible in the video.
  */
 export async function injectCursor(page: Page): Promise<void> {
-  await page.evaluate(({ moveDuration, clickDuration }: { moveDuration: number; clickDuration: number }) => {
-    if (document.getElementById('demo-cursor')) return;
+  await page.evaluate(
+    ({ moveDuration, clickDuration }: { moveDuration: number; clickDuration: number }) => {
+      if (document.getElementById('demo-cursor')) return;
 
-    const cursor = document.createElement('div');
-    cursor.id = 'demo-cursor';
-    cursor.innerHTML = `
+      const cursor = document.createElement('div');
+      cursor.id = 'demo-cursor';
+      cursor.innerHTML = `
       <div id="demo-cursor-dot"></div>
       <div id="demo-cursor-ring"></div>
     `;
 
-    const style = document.createElement('style');
-    style.textContent = `
+      const style = document.createElement('style');
+      style.textContent = `
       #demo-cursor {
         position: fixed;
         top: 0;
@@ -60,9 +61,11 @@ export async function injectCursor(page: Page): Promise<void> {
       }
     `;
 
-    document.head.appendChild(style);
-    document.body.appendChild(cursor);
-  }, { moveDuration: CURSOR_MOVE_DURATION_MS, clickDuration: CLICK_EFFECT_DURATION_MS });
+      document.head.appendChild(style);
+      document.body.appendChild(cursor);
+    },
+    { moveDuration: CURSOR_MOVE_DURATION_MS, clickDuration: CLICK_EFFECT_DURATION_MS },
+  );
 }
 
 /**
@@ -88,7 +91,12 @@ export async function cursorClickLocator(page: Page, locator: Locator): Promise<
  * and shows the click animation. Used for clicks inside iframes where we
  * need to translate frame-relative coords to page-level coords.
  */
-export async function cursorClickAt(page: Page, frame: Frame, frameRelativeX: number, frameRelativeY: number): Promise<void> {
+export async function cursorClickAt(
+  page: Page,
+  frame: Frame,
+  frameRelativeX: number,
+  frameRelativeY: number,
+): Promise<void> {
   // Find the iframe element's position in the main page to offset coordinates
   const iframeOffset = await page.evaluate(() => {
     const iframe = document.querySelector('iframe');
@@ -107,7 +115,11 @@ export async function cursorClickAt(page: Page, frame: Frame, frameRelativeX: nu
  * Resolves the bounding box of an element found via evaluate() inside a frame,
  * then animates the cursor and clicks it.
  */
-export async function cursorClickElement(page: Page, frame: Frame, selector: string): Promise<void> {
+export async function cursorClickElement(
+  page: Page,
+  frame: Frame,
+  selector: string,
+): Promise<void> {
   const box = await frame.evaluate((sel: string) => {
     const el = document.querySelector(sel);
     if (!el) return null;
@@ -130,11 +142,14 @@ export async function animateCursorTo(page: Page, x: number, y: number): Promise
 
 async function animateCursorAndClick(page: Page, x: number, y: number): Promise<void> {
   // Move cursor to target position
-  await page.evaluate(({ x, y }: { x: number; y: number }) => {
-    const cursor = document.getElementById('demo-cursor');
-    if (!cursor) return;
-    cursor.style.transform = `translate(${x}px, ${y}px)`;
-  }, { x, y });
+  await page.evaluate(
+    ({ x, y }: { x: number; y: number }) => {
+      const cursor = document.getElementById('demo-cursor');
+      if (!cursor) return;
+      cursor.style.transform = `translate(${x}px, ${y}px)`;
+    },
+    { x, y },
+  );
 
   // Wait for the move animation to complete
   await page.waitForTimeout(CURSOR_MOVE_DURATION_MS + 50);

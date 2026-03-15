@@ -17,7 +17,6 @@ export interface StepAudioPlan {
 
 const AUDIO_BUFFER_MS = 500;
 const MIN_STEP_DELAY_MS = 1500;
-const DEFAULT_STEP_DELAY_MS = 2000;
 const MAX_CONCURRENT = 3;
 
 /**
@@ -36,7 +35,7 @@ export async function generateStepAudio(
 
   const entries = Object.entries(stepNarration)
     .map(([key, text]) => ({ stepIndex: parseInt(key, 10), text: text.trim() }))
-    .filter(e => !isNaN(e.stepIndex) && e.text.length > 0)
+    .filter((e) => !isNaN(e.stepIndex) && e.text.length > 0)
     .sort((a, b) => a.stepIndex - b.stepIndex);
 
   console.log(`Generating ${entries.length} step narration clips...`);
@@ -65,7 +64,7 @@ export async function generateStepAudio(
           durationMs,
           text: entry.text,
         };
-      })
+      }),
     );
     clips.push(...results);
   }

@@ -53,7 +53,11 @@ const NAV_DELAY_MS = 2000;
 const END_DELAY_MS = 2000;
 const NAV_TIMEOUT_MS = 120_000;
 
-export async function playDemo(specPath: string, config: DemoConfig, options?: PlayOptions): Promise<PlayResult> {
+export async function playDemo(
+  specPath: string,
+  config: DemoConfig,
+  options?: PlayOptions,
+): Promise<PlayResult> {
   const absoluteSpecPath = resolve(specPath);
   const specContent = readFileSync(absoluteSpecPath, 'utf-8');
   const recording: Recording = parseYaml(specContent);
@@ -125,7 +129,7 @@ export async function playDemo(specPath: string, config: DemoConfig, options?: P
     await injectCursor(page);
     // Brief pause so the first frame of the trimmed video shows the loaded page
     await page.waitForTimeout(500);
-    const trimStartMs = (bcReadyMs - videoStartMs);
+    const trimStartMs = bcReadyMs - videoStartMs;
     console.log(`BC loaded (trimming ${(trimStartMs / 1000).toFixed(1)}s of loading screen)`);
 
     const timingSteps: StepTimingEntry[] = [];
@@ -140,10 +144,12 @@ export async function playDemo(specPath: string, config: DemoConfig, options?: P
     const snapshot = await frame.evaluate(() => {
       // Collect all buttons and actions visible on the page
       const buttons: string[] = [];
-      document.querySelectorAll('button, [role="button"], [role="menuitem"], a[tabindex]').forEach(el => {
-        const text = (el as HTMLElement).innerText?.trim();
-        if (text && text.length < 80) buttons.push(text);
-      });
+      document
+        .querySelectorAll('button, [role="button"], [role="menuitem"], a[tabindex]')
+        .forEach((el) => {
+          const text = (el as HTMLElement).innerText?.trim();
+          if (text && text.length < 80) buttons.push(text);
+        });
       return { buttons: buttons.slice(0, 30), title: document.title };
     });
     console.log(`Page title: ${snapshot.title}`);
@@ -154,13 +160,17 @@ export async function playDemo(specPath: string, config: DemoConfig, options?: P
       const info: string[] = [];
       // Check for grids
       document.querySelectorAll('[role="grid"]').forEach((g, gi) => {
-        info.push(`grid[${gi}]: ${(g as HTMLElement).getAttribute('aria-label') || g.className.slice(0, 50)}`);
+        info.push(
+          `grid[${gi}]: ${(g as HTMLElement).getAttribute('aria-label') || g.className.slice(0, 50)}`,
+        );
         const rows = g.querySelectorAll('[role="row"]');
         info.push(`  rows: ${rows.length}`);
         rows.forEach((r, ri) => {
           if (ri < 3) {
             const cells = r.querySelectorAll('[role="gridcell"], [role="columnheader"]');
-            const texts = Array.from(cells).map(c => (c as HTMLElement).innerText?.trim().slice(0, 30)).filter(Boolean);
+            const texts = Array.from(cells)
+              .map((c) => (c as HTMLElement).innerText?.trim().slice(0, 30))
+              .filter(Boolean);
             info.push(`  row[${ri}]: ${texts.join(' | ')}`);
           }
         });
@@ -172,7 +182,7 @@ export async function playDemo(specPath: string, config: DemoConfig, options?: P
       // Check for any clickable links in the main content area
       const links = document.querySelectorAll('a[href], a[tabindex]');
       const linkTexts: string[] = [];
-      links.forEach(l => {
+      links.forEach((l) => {
         const text = (l as HTMLElement).innerText?.trim();
         if (text && text.length < 60 && text.length > 0) linkTexts.push(text);
       });
@@ -180,13 +190,15 @@ export async function playDemo(specPath: string, config: DemoConfig, options?: P
       return info;
     });
     console.log('DOM structure:');
-    gridInfo.forEach(line => console.log(`  ${line}`));
+    gridInfo.forEach((line) => console.log(`  ${line}`));
 
     // Execute each step using Playwright clicks with delays
     for (let i = 0; i < recording.steps.length; i++) {
       const step = recording.steps[i];
       const stepStartMs = Date.now() - videoStartMs;
-      console.log(`\nStep ${i + 1}/${recording.steps.length}: [${step.type}] ${step.description ?? step.caption ?? ''}`);
+      console.log(
+        `\nStep ${i + 1}/${recording.steps.length}: [${step.type}] ${step.description ?? step.caption ?? ''}`,
+      );
 
       const currentFrame = await awaitBCFrame(page, 10_000).catch(() => frame);
 
@@ -206,27 +218,49 @@ export async function playDemo(specPath: string, config: DemoConfig, options?: P
             await page.waitForTimeout(500); // Wait for dropdown to render
 
             // Dump all text in the frame to find the element
-            const allText = await currentFrame.evaluate((caption: string) => {
+            const allText = await currentFrame.evaluate(() => {
               const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
               const results: string[] = [];
               let node: Node | null;
               while ((node = walker.nextNode())) {
                 const el = node as HTMLElement;
-                const text = el.textContent?.trim() ?? '';
-                const own = el.childNodes.length === 1 && el.childNodes[0].nodeType === Node.TEXT_NODE
-                  ? el.childNodes[0].textContent?.trim() ?? '' : '';
-                if (own && own.length > 0 && own.length < 60 && own.toLowerCase().includes('more')) {
-                  results.push(`<${el.tagName.toLowerCase()} class="${el.className?.toString().slice(0, 40)}" role="${el.getAttribute('role')}">${own}`);
+                const own =
+                  el.childNodes.length === 1 && el.childNodes[0].nodeType === Node.TEXT_NODE
+                    ? (el.childNodes[0].textContent?.trim() ?? '')
+                    : '';
+                if (
+                  own &&
+                  own.length > 0 &&
+                  own.length < 60 &&
+                  own.toLowerCase().includes('more')
+                ) {
+                  results.push(
+                    `<${el.tagName.toLowerCase()} class="${el.className?.toString().slice(0, 40)}" role="${el.getAttribute('role')}">${own}`,
+                  );
                 }
-                if (own && own.length > 0 && own.length < 60 && own.toLowerCase().includes('column')) {
-                  results.push(`<${el.tagName.toLowerCase()} class="${el.className?.toString().slice(0, 40)}" role="${el.getAttribute('role')}">${own}`);
+                if (
+                  own &&
+                  own.length > 0 &&
+                  own.length < 60 &&
+                  own.toLowerCase().includes('column')
+                ) {
+                  results.push(
+                    `<${el.tagName.toLowerCase()} class="${el.className?.toString().slice(0, 40)}" role="${el.getAttribute('role')}">${own}`,
+                  );
                 }
-                if (own && own.length > 0 && own.length < 60 && own.toLowerCase().includes('show')) {
-                  results.push(`<${el.tagName.toLowerCase()} class="${el.className?.toString().slice(0, 40)}" role="${el.getAttribute('role')}">${own}`);
+                if (
+                  own &&
+                  own.length > 0 &&
+                  own.length < 60 &&
+                  own.toLowerCase().includes('show')
+                ) {
+                  results.push(
+                    `<${el.tagName.toLowerCase()} class="${el.className?.toString().slice(0, 40)}" role="${el.getAttribute('role')}">${own}`,
+                  );
                 }
               }
               return [...new Set(results)].slice(0, 30);
-            }, step.caption);
+            });
             console.log(`  DOM elements with "show/more/column": ${allText.join('\n    ')}`);
 
             clicked = await clickBCAction(currentFrame, page, step.caption);
@@ -234,19 +268,27 @@ export async function playDemo(specPath: string, config: DemoConfig, options?: P
         }
 
         if (!clicked) {
-          console.log(`  WARNING: Could not find "${step.caption}" — falling back to DN.playRecording`);
+          console.log(
+            `  WARNING: Could not find "${step.caption}" — falling back to DN.playRecording`,
+          );
           const singleStep = { ...recording, steps: [step] };
           await currentFrame.evaluate((data) => {
-            const DN = (window as unknown as Record<string, unknown>)['DN'] as Record<string, Function>;
+            const DN = (window as unknown as Record<string, unknown>)['DN'] as Record<
+              string,
+              (...args: unknown[]) => unknown
+            >;
             return DN['playRecording'](data);
           }, singleStep as unknown);
         }
       } else if (step.type === 'input' && step.value) {
-        const fieldName = step.target?.find(t => t.field)?.field;
+        const fieldName = step.target?.find((t) => t.field)?.field;
         console.log(`  Filling field "${fieldName}" with "${step.value}"`);
         const singleStep = { ...recording, steps: [step] };
         await currentFrame.evaluate((data) => {
-          const DN = (window as unknown as Record<string, unknown>)['DN'] as Record<string, Function>;
+          const DN = (window as unknown as Record<string, unknown>)['DN'] as Record<
+            string,
+            (...args: unknown[]) => unknown
+          >;
           return DN['playRecording'](data);
         }, singleStep as unknown);
       }
@@ -258,7 +300,7 @@ export async function playDemo(specPath: string, config: DemoConfig, options?: P
         // Log what's on the page after this step
         const postSnap = await postFrame.evaluate(() => {
           const btns: string[] = [];
-          document.querySelectorAll('button, [role="button"], [role="menuitem"]').forEach(el => {
+          document.querySelectorAll('button, [role="button"], [role="menuitem"]').forEach((el) => {
             const text = (el as HTMLElement).innerText?.trim();
             if (text && text.length > 0 && text.length < 60) btns.push(text);
           });
@@ -288,7 +330,6 @@ export async function playDemo(specPath: string, config: DemoConfig, options?: P
     const timingPath = resolve(outputDir, `${specName}.timing.json`);
     writeFileSync(timingPath, JSON.stringify(timing, null, 2));
     console.log(`Timing saved: ${timingPath}`);
-
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`Player error: ${message}`);
@@ -330,16 +371,23 @@ async function clickBCRow(frame: Frame, rowNumber: number, page?: Page): Promise
     const rowBox = await frame.evaluate((targetRow: number) => {
       // Find data rows, skipping headers (rows with <th> or columnheader)
       function getDataRows(): Element[] {
-        const tables = document.querySelectorAll('table.ms-nav-grid-data-table, table[class*="ms-nav-grid"][class*="data"]');
+        const tables = document.querySelectorAll(
+          'table.ms-nav-grid-data-table, table[class*="ms-nav-grid"][class*="data"]',
+        );
         for (const table of tables) {
           const rows = Array.from(table.querySelectorAll('tbody > tr, tr[role="row"]'));
-          const data = rows.filter(r => !r.querySelector('th') && !r.querySelector('[role="columnheader"]') && r.querySelector('td'));
+          const data = rows.filter(
+            (r) =>
+              !r.querySelector('th') &&
+              !r.querySelector('[role="columnheader"]') &&
+              r.querySelector('td'),
+          );
           if (data.length > 0) return data;
         }
         const grids = document.querySelectorAll('[role="grid"]');
         for (const grid of grids) {
           const rows = Array.from(grid.querySelectorAll('[role="row"]'));
-          return rows.filter(r => !r.querySelector('[role="columnheader"]'));
+          return rows.filter((r) => !r.querySelector('[role="columnheader"]'));
         }
         return [];
       }
@@ -361,16 +409,23 @@ async function clickBCRow(frame: Frame, rowNumber: number, page?: Page): Promise
   // Actually click the row — same data-row filtering as cursor positioning
   const clicked = await frame.evaluate((targetRow: number) => {
     function getDataRows(): Element[] {
-      const tables = document.querySelectorAll('table.ms-nav-grid-data-table, table[class*="ms-nav-grid"][class*="data"]');
+      const tables = document.querySelectorAll(
+        'table.ms-nav-grid-data-table, table[class*="ms-nav-grid"][class*="data"]',
+      );
       for (const table of tables) {
         const rows = Array.from(table.querySelectorAll('tbody > tr, tr[role="row"]'));
-        const data = rows.filter(r => !r.querySelector('th') && !r.querySelector('[role="columnheader"]') && r.querySelector('td'));
+        const data = rows.filter(
+          (r) =>
+            !r.querySelector('th') &&
+            !r.querySelector('[role="columnheader"]') &&
+            r.querySelector('td'),
+        );
         if (data.length > 0) return data;
       }
       const grids = document.querySelectorAll('[role="grid"]');
       for (const grid of grids) {
         const rows = Array.from(grid.querySelectorAll('[role="row"]'));
-        return rows.filter(r => !r.querySelector('[role="columnheader"]'));
+        return rows.filter((r) => !r.querySelector('[role="columnheader"]'));
       }
       return [];
     }
@@ -406,7 +461,7 @@ async function clickBCAction(frame: Frame, page: Page, caption: string): Promise
   // Strategy 1: Exact match button/menuitem by accessible name
   for (const role of ['button', 'menuitem', 'link'] as const) {
     const locator = frame.getByRole(role, { name: caption, exact: true });
-    if (await locator.count() > 0) {
+    if ((await locator.count()) > 0) {
       console.log(`  Clicking [${role}] "${caption}"`);
       await animateCursorToLocator(page, frame, locator);
       await locator.first().click();
@@ -417,7 +472,7 @@ async function clickBCAction(frame: Frame, page: Page, caption: string): Promise
   // Strategy 2: Partial text match (caption might be part of a longer label)
   for (const role of ['button', 'menuitem', 'link'] as const) {
     const locator = frame.getByRole(role, { name: caption });
-    if (await locator.count() > 0) {
+    if ((await locator.count()) > 0) {
       console.log(`  Clicking [${role}] containing "${caption}" (partial match)`);
       await animateCursorToLocator(page, frame, locator);
       await locator.first().click();
@@ -426,8 +481,10 @@ async function clickBCAction(frame: Frame, page: Page, caption: string): Promise
   }
 
   // Strategy 3: CSS text content match (broad — catches action bar items)
-  const textLocator = frame.locator(`button:has-text("${caption}"), [role="button"]:has-text("${caption}"), [role="menuitem"]:has-text("${caption}"), a:has-text("${caption}"), span:has-text("${caption}")`);
-  if (await textLocator.count() > 0) {
+  const textLocator = frame.locator(
+    `button:has-text("${caption}"), [role="button"]:has-text("${caption}"), [role="menuitem"]:has-text("${caption}"), a:has-text("${caption}"), span:has-text("${caption}")`,
+  );
+  if ((await textLocator.count()) > 0) {
     console.log(`  Clicking element containing text "${caption}"`);
     await animateCursorToLocator(page, frame, textLocator);
     await textLocator.first().click();
@@ -436,7 +493,7 @@ async function clickBCAction(frame: Frame, page: Page, caption: string): Promise
 
   // Strategy 4: getByText — finds any visible text match in the frame
   const byText = frame.getByText(caption, { exact: true });
-  if (await byText.count() > 0) {
+  if ((await byText.count()) > 0) {
     console.log(`  Clicking text "${caption}" (getByText)`);
     await animateCursorToLocator(page, frame, byText);
     await byText.first().click();
@@ -444,8 +501,10 @@ async function clickBCAction(frame: Frame, page: Page, caption: string): Promise
   }
 
   // Strategy 5: Try the main page (not just the frame) — some actions are in the top bar
-  const pageLocator = page.locator(`button:has-text("${caption}"), [role="button"]:has-text("${caption}")`);
-  if (await pageLocator.count() > 0) {
+  const pageLocator = page.locator(
+    `button:has-text("${caption}"), [role="button"]:has-text("${caption}")`,
+  );
+  if ((await pageLocator.count()) > 0) {
     console.log(`  Clicking top-bar element "${caption}"`);
     await cursorClickLocator(page, pageLocator);
     await pageLocator.first().click();
@@ -460,7 +519,11 @@ async function clickBCAction(frame: Frame, page: Page, caption: string): Promise
  * Animates the cursor to a Playwright locator. boundingBox() returns
  * page-level coordinates already, so we animate directly — no iframe offset.
  */
-async function animateCursorToLocator(page: Page, _frame: Frame, locator: import('playwright').Locator): Promise<void> {
+async function animateCursorToLocator(
+  page: Page,
+  _frame: Frame,
+  locator: import('playwright').Locator,
+): Promise<void> {
   try {
     const box = await locator.first().boundingBox();
     if (box) {
@@ -480,18 +543,24 @@ async function awaitBCFrame(page: Page, timeout = NAV_TIMEOUT_MS): Promise<Frame
   const start = Date.now();
   while (Date.now() - start < timeout) {
     const isIdle = await page.evaluate(() => {
-      const ns = (window as unknown as Record<string, unknown>);
-      const namespace = (ns['BC'] ?? ns['DN']) as { ExecutionContext?: { Instance?: { IsIdle?: () => boolean } } } | undefined;
+      const ns = window as unknown as Record<string, unknown>;
+      const namespace = (ns['BC'] ?? ns['DN']) as
+        | { ExecutionContext?: { Instance?: { IsIdle?: () => boolean } } }
+        | undefined;
       return namespace?.ExecutionContext?.Instance?.IsIdle?.() ?? false;
     });
 
     if (isIdle) {
       const frames = page.frames();
       if (frames.length > 1) {
-        const frameIdle = await frames[1].evaluate(() => {
-          const DN = (window as unknown as Record<string, unknown>)['DN'] as { ExecutionContext?: { Instance?: { IsIdle?: () => boolean } } } | undefined;
-          return DN?.ExecutionContext?.Instance?.IsIdle?.() ?? false;
-        }).catch(() => false);
+        const frameIdle = await frames[1]
+          .evaluate(() => {
+            const DN = (window as unknown as Record<string, unknown>)['DN'] as
+              | { ExecutionContext?: { Instance?: { IsIdle?: () => boolean } } }
+              | undefined;
+            return DN?.ExecutionContext?.Instance?.IsIdle?.() ?? false;
+          })
+          .catch(() => false);
         if (frameIdle) return frames[1];
       }
     }

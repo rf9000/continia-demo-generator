@@ -39,7 +39,7 @@ export function generateSubtitles(
   let srtIndex = 1;
 
   for (const clip of clips) {
-    const stepTiming = timing.steps.find(s => s.stepIndex === clip.stepIndex);
+    const stepTiming = timing.steps.find((s) => s.stepIndex === clip.stepIndex);
     if (!stepTiming) continue;
 
     const startMs = Math.max(0, stepTiming.startMs - timing.trimStartMs);
@@ -49,7 +49,7 @@ export function generateSubtitles(
     const text = clip.text.replace(/\n/g, '\\N');
     const wrapped = wrapText(text, 70).replace(/\n/g, '\\N');
     assLines.push(
-      `Dialogue: 0,${formatAssTime(startMs)},${formatAssTime(endMs)},Default,,0,0,0,,{\\fad(${FADE_IN_MS},${FADE_OUT_MS})}${wrapped}`
+      `Dialogue: 0,${formatAssTime(startMs)},${formatAssTime(endMs)},Default,,0,0,0,,{\\fad(${FADE_IN_MS},${FADE_OUT_MS})}${wrapped}`,
     );
 
     // SRT entry (plain, no effects)
