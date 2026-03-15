@@ -120,6 +120,14 @@ export async function cursorClickElement(page: Page, frame: Frame, selector: str
   }
 }
 
+/**
+ * Animates the cursor to page-level coordinates and shows the click effect.
+ * Use this when you already have page-level coords (e.g. from boundingBox).
+ */
+export async function animateCursorTo(page: Page, x: number, y: number): Promise<void> {
+  return animateCursorAndClick(page, x, y);
+}
+
 async function animateCursorAndClick(page: Page, x: number, y: number): Promise<void> {
   // Move cursor to target position
   await page.evaluate(({ x, y }: { x: number; y: number }) => {

@@ -3,7 +3,7 @@ import { readFileSync, copyFileSync, writeFileSync, mkdirSync } from 'fs';
 import { parse as parseYaml } from 'yaml';
 import { resolve, parse as parsePath } from 'path';
 import { DemoConfig } from './config.js';
-import { injectCursor, cursorClickLocator, cursorClickAt } from './cursor.js';
+import { injectCursor, cursorClickLocator, cursorClickAt, animateCursorTo } from './cursor.js';
 
 export interface Recording {
   description: string;
@@ -333,10 +333,12 @@ async function clickBCRow(frame: Frame, rowNumber: number, page?: Page): Promise
         const rows = table.querySelectorAll('tbody > tr, tr[role="row"]');
         const row = rows[targetRow - 1];
         if (!row) continue;
+        // Target the first link (primary key field) — leftmost clickable field
         const link = row.querySelector('a');
         const el = link ?? row.querySelector('td') ?? row;
         const rect = (el as HTMLElement).getBoundingClientRect();
-        return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+        // Click near the left side of the link text, not the center
+        return { x: rect.x + Math.min(rect.width * 0.3, 40), y: rect.y + rect.height / 2 };
       }
       return null;
     }, rowNumber);
@@ -456,14 +458,14 @@ async function clickBCAction(frame: Frame, page: Page, caption: string): Promise
 }
 
 /**
- * Animates the cursor to a locator that lives inside a frame (iframe).
- * Translates frame-relative coordinates to page-level coordinates.
+ * Animates the cursor to a Playwright locator. boundingBox() returns
+ * page-level coordinates already, so we animate directly — no iframe offset.
  */
-async function animateCursorToLocator(page: Page, frame: Frame, locator: import('playwright').Locator): Promise<void> {
+async function animateCursorToLocator(page: Page, _frame: Frame, locator: import('playwright').Locator): Promise<void> {
   try {
     const box = await locator.first().boundingBox();
     if (box) {
-      await cursorClickAt(page, frame, box.x + box.width / 2, box.y + box.height / 2);
+      await animateCursorTo(page, box.x + box.width / 2, box.y + box.height / 2);
     }
   } catch {
     // Element might not be visible — skip cursor animation
