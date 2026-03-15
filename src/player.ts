@@ -325,22 +325,32 @@ export async function playDemo(specPath: string, config: DemoConfig, options?: P
 async function clickBCRow(frame: Frame, rowNumber: number, page?: Page): Promise<void> {
   console.log(`  Clicking row ${rowNumber} in list grid...`);
 
-  // Animate cursor to the target row before clicking
+  // Animate cursor to the first link in the target data row
   if (page) {
     const rowBox = await frame.evaluate((targetRow: number) => {
-      const dataTables = document.querySelectorAll('table.ms-nav-grid-data-table, table[class*="ms-nav-grid"][class*="data"]');
-      for (const table of dataTables) {
-        const rows = table.querySelectorAll('tbody > tr, tr[role="row"]');
-        const row = rows[targetRow - 1];
-        if (!row) continue;
-        // Target the first link (primary key field) — leftmost clickable field
-        const link = row.querySelector('a');
-        const el = link ?? row.querySelector('td') ?? row;
-        const rect = (el as HTMLElement).getBoundingClientRect();
-        // Click near the left side of the link text, not the center
-        return { x: rect.x + Math.min(rect.width * 0.3, 40), y: rect.y + rect.height / 2 };
+      // Find data rows, skipping headers (rows with <th> or columnheader)
+      function getDataRows(): Element[] {
+        const tables = document.querySelectorAll('table.ms-nav-grid-data-table, table[class*="ms-nav-grid"][class*="data"]');
+        for (const table of tables) {
+          const rows = Array.from(table.querySelectorAll('tbody > tr, tr[role="row"]'));
+          const data = rows.filter(r => !r.querySelector('th') && !r.querySelector('[role="columnheader"]') && r.querySelector('td'));
+          if (data.length > 0) return data;
+        }
+        const grids = document.querySelectorAll('[role="grid"]');
+        for (const grid of grids) {
+          const rows = Array.from(grid.querySelectorAll('[role="row"]'));
+          return rows.filter(r => !r.querySelector('[role="columnheader"]'));
+        }
+        return [];
       }
-      return null;
+      const rows = getDataRows();
+      const row = rows[targetRow - 1];
+      if (!row) return null;
+
+      const link = row.querySelector('a');
+      const el = link ?? row.querySelector('td') ?? row;
+      const rect = (el as HTMLElement).getBoundingClientRect();
+      return { x: rect.x + Math.min(rect.width * 0.3, 40), y: rect.y + rect.height / 2 };
     }, rowNumber);
 
     if (rowBox) {
@@ -348,54 +358,43 @@ async function clickBCRow(frame: Frame, rowNumber: number, page?: Page): Promise
     }
   }
 
-  // BC grids use: div[role="grid"] > table.ms-nav-grid-data-table > tbody > tr
-  // The header table comes first, then the data table.
+  // Actually click the row — same data-row filtering as cursor positioning
   const clicked = await frame.evaluate((targetRow: number) => {
-    // Strategy 1: Find the data table inside a BC grid container
-    const dataTables = document.querySelectorAll('table.ms-nav-grid-data-table, table[class*="ms-nav-grid"][class*="data"]');
-    for (const table of dataTables) {
-      const rows = table.querySelectorAll('tbody > tr, tr[role="row"]');
-      const row = rows[targetRow - 1]; // 1-indexed
-      if (!row) continue;
-
-      const link = row.querySelector('a');
-      if (link) {
-        (link as HTMLElement).click();
-        return `clicked link: ${link.textContent?.trim()}`;
+    function getDataRows(): Element[] {
+      const tables = document.querySelectorAll('table.ms-nav-grid-data-table, table[class*="ms-nav-grid"][class*="data"]');
+      for (const table of tables) {
+        const rows = Array.from(table.querySelectorAll('tbody > tr, tr[role="row"]'));
+        const data = rows.filter(r => !r.querySelector('th') && !r.querySelector('[role="columnheader"]') && r.querySelector('td'));
+        if (data.length > 0) return data;
       }
-      const cell = row.querySelector('td');
-      if (cell) {
-        (cell as HTMLElement).click();
-        return `clicked cell: ${cell.textContent?.trim()}`;
+      const grids = document.querySelectorAll('[role="grid"]');
+      for (const grid of grids) {
+        const rows = Array.from(grid.querySelectorAll('[role="row"]'));
+        return rows.filter(r => !r.querySelector('[role="columnheader"]'));
       }
+      return [];
     }
+    const rows = getDataRows();
+    const row = rows[targetRow - 1];
+    if (!row) return null;
 
-    // Strategy 2: Find data rows in role="grid" with role="row" (non-header)
-    const grids = document.querySelectorAll('[role="grid"]');
-    for (const grid of grids) {
-      const allRows = grid.querySelectorAll('[role="row"]');
-      const dataRows = Array.from(allRows).filter(
-        r => !r.querySelector('[role="columnheader"]')
-      );
-      const row = dataRows[targetRow - 1];
-      if (!row) continue;
-
-      const link = row.querySelector('a');
-      if (link) {
-        (link as HTMLElement).click();
-        return `clicked link: ${link.textContent?.trim()}`;
-      }
-      (row as HTMLElement).click();
-      return `clicked row element`;
+    const link = row.querySelector('a');
+    if (link) {
+      (link as HTMLElement).click();
+      return `clicked link: ${link.textContent?.trim()}`;
     }
-
+    const cell = row.querySelector('td');
+    if (cell) {
+      (cell as HTMLElement).click();
+      return `clicked cell: ${cell.textContent?.trim()}`;
+    }
     return null;
   }, rowNumber);
 
   if (clicked) {
     console.log(`  ${clicked}`);
   } else {
-    console.log(`  WARNING: Could not find row ${rowNumber} in any grid`);
+    console.log(`  WARNING: Could not find data row ${rowNumber} in any grid`);
   }
 }
 
