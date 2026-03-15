@@ -9,3 +9,4 @@ demos/
 .tools/
 test-results/
 demo-results/
+.eslintcache

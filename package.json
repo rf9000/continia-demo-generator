@@ -11,7 +11,12 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "start": "node dist/cli.js",
-    "generate-demo": "node dist/cli.js"
+    "generate-demo": "node dist/cli.js",
+    "prepare": "husky",
+    "lint": "eslint --cache src/",
+    "lint:fix": "eslint --cache --fix src/",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\""
   },
   "keywords": [
     "business-central",
@@ -32,8 +37,18 @@
     "yaml": "^2.8.2"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^25.5.0",
+    "eslint": "^10.0.3",
+    "eslint-config-prettier": "^10.1.8",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.4.0",
+    "prettier": "^3.8.1",
     "typescript": "^5.9.3",
+    "typescript-eslint": "^8.57.0",
     "vitest": "^4.1.0"
+  },
+  "lint-staged": {
+    "**/*.ts": ["eslint --fix", "prettier --write"]
   }
 }
