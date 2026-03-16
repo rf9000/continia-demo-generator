@@ -318,11 +318,12 @@ export async function playDemo(
           }, singleStep as unknown);
         }
 
-        // Re-scroll to show the filled field
+        // Re-scroll to show the filled field and animate cursor there
         if (fieldName) {
           await page.waitForTimeout(300);
           const postFrame = await awaitBCFrame(page, 5_000).catch(() => currentFrame);
           await scrollFieldToCenter(postFrame, page, fieldName);
+          await animateCursorToField(postFrame, page, fieldName);
         }
       }
 
