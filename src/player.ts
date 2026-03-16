@@ -277,48 +277,52 @@ export async function playDemo(
         const fieldName = step.target?.find((t) => t.field)?.field;
         debug(`Filling field "${fieldName}" with "${step.value}"`);
 
-        // If the field is in a collapsed FastTab, expand it first so the
-        // cursor can reach it before DN.playRecording fills the value.
+        // If the field is in a collapsed FastTab, expand it first
         if (fieldName) {
           await expandFastTabForField(currentFrame, page, fieldName);
         }
 
-        // Scroll to center and move cursor BEFORE filling the value.
-        let cursorMoved = false;
+        // Scroll field into view and animate cursor
         if (fieldName) {
           await scrollFieldToCenter(currentFrame, page, fieldName);
-          cursorMoved = await animateCursorToField(currentFrame, page, fieldName);
+          await animateCursorToField(currentFrame, page, fieldName);
         }
 
-        const singleStep = { ...recording, steps: [step] };
-        await currentFrame.evaluate((data) => {
-          const DN = (window as unknown as Record<string, unknown>)['DN'] as Record<
-            string,
-            (...args: unknown[]) => unknown
-          >;
-          return DN['playRecording'](data);
-        }, singleStep as unknown);
+        // Try to fill via td[controlname] first (reliable for BC grid cells),
+        // then fall back to DN.playRecording for card/FastTab fields.
+        let directFilled = false;
+        if (fieldName) {
+          const inputHandle = await currentFrame.$(
+            `td[controlname="${fieldName}"] input, td[controlname="${fieldName}"] [role="textbox"]`,
+          );
+          if (inputHandle) {
+            await inputHandle.click();
+            await page.waitForTimeout(100);
+            await inputHandle.fill(step.value);
+            await page.waitForTimeout(100);
+            await inputHandle.press('Tab');
+            directFilled = true;
+            debug(`Direct fill: entered "${step.value}" in "${fieldName}"`);
+          }
+        }
 
-        // If cursor couldn't reach the field before filling (e.g. field was
-        // only made visible by DN.playRecording), move it there now.
-        if (!cursorMoved && fieldName) {
+        if (!directFilled) {
+          debug(`Falling back to DN.playRecording for "${fieldName}"`);
+          const singleStep = { ...recording, steps: [step] };
+          await currentFrame.evaluate((data) => {
+            const DN = (window as unknown as Record<string, unknown>)['DN'] as Record<
+              string,
+              (...args: unknown[]) => unknown
+            >;
+            return DN['playRecording'](data);
+          }, singleStep as unknown);
+        }
+
+        // Re-scroll to show the filled field
+        if (fieldName) {
           await page.waitForTimeout(300);
           const postFrame = await awaitBCFrame(page, 5_000).catch(() => currentFrame);
           await scrollFieldToCenter(postFrame, page, fieldName);
-          cursorMoved = await animateCursorToField(postFrame, page, fieldName);
-          if (!cursorMoved) {
-            const activeBox = await postFrame.evaluate(() => {
-              const el = document.activeElement as HTMLElement | null;
-              if (!el) return null;
-              const rect = el.getBoundingClientRect();
-              if (rect.width === 0 && rect.height === 0) return null;
-              return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-            });
-            if (activeBox) {
-              debug(`Cursor fallback: using focused element`);
-              await cursorClickAt(page, postFrame, activeBox.x, activeBox.y);
-            }
-          }
         }
       }
 
@@ -551,73 +555,197 @@ async function expandFastTabForField(frame: Frame, page: Page, fieldName: string
 }
 
 async function scrollFieldToCenter(frame: Frame, page: Page, fieldName: string): Promise<void> {
+  const viewportWidth = 1920;
   const viewportHeight = 1080;
   const comfortZoneTop = viewportHeight * 0.25;
   const comfortZoneBottom = viewportHeight * 0.75;
+  const comfortZoneLeft = viewportWidth * 0.1;
+  const comfortZoneRight = viewportWidth * 0.9;
 
   const result = await frame.evaluate(
-    ({ name, zoneTop, zoneBottom }) => {
-      // Find the field element
+    ({ name, zoneTop, zoneBottom, zoneLeft, zoneRight }) => {
+      // Find the field element in BC DOM
       function findField(): Element | null {
-        for (const el of document.querySelectorAll(`[aria-label*="${name}"]`)) {
+        function visible(el: Element) {
           const r = (el as HTMLElement).getBoundingClientRect();
-          if (r.width > 0 && r.height > 0) return el;
+          return r.width > 0 && r.height > 0;
         }
-        for (const el of document.querySelectorAll(`[title*="${name}"]`)) {
-          const r = (el as HTMLElement).getBoundingClientRect();
-          if (r.width > 0 && r.height > 0) return el;
+        // Strategy 1: BC grid cell — td[controlname] contains the input
+        for (const td of document.querySelectorAll(`td[controlname="${name}"]`)) {
+          const input = td.querySelector(
+            'input, textarea, select, [role="textbox"], [role="combobox"]',
+          );
+          if (input && visible(input)) return input;
+          if (visible(td)) return td;
         }
+        // Strategy 2: Exact aria-label match
+        for (const el of document.querySelectorAll(`[aria-label="${name}"]`)) {
+          if (visible(el)) return el;
+        }
+        // Strategy 3: Input elements with substring aria-label match
         for (const el of document.querySelectorAll(
           'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]',
         )) {
           if (el.getAttribute('aria-label')?.includes(name)) {
-            const r = (el as HTMLElement).getBoundingClientRect();
-            if (r.width > 0 && r.height > 0) return el;
+            if (visible(el)) return el;
           }
+        }
+        // Strategy 4: Substring aria-label — pick shortest label (most specific)
+        const candidates: Element[] = [];
+        for (const el of document.querySelectorAll(`[aria-label*="${name}"]`)) {
+          if (el.getAttribute('aria-label')?.startsWith('Open menu for')) continue;
+          if (visible(el)) candidates.push(el);
+        }
+        if (candidates.length > 0) {
+          candidates.sort(
+            (a, b) =>
+              (a.getAttribute('aria-label')?.length ?? 0) -
+              (b.getAttribute('aria-label')?.length ?? 0),
+          );
+          return candidates[0];
+        }
+        // Strategy 5: Title attribute match (skip "Open Menu" links)
+        for (const el of document.querySelectorAll(`[title*="${name}"]`)) {
+          if (el.getAttribute('title') === 'Open Menu') continue;
+          if (visible(el)) return el;
         }
         return null;
       }
 
       const el = findField();
-      if (!el) return null;
+      if (!el) return { found: false } as const;
 
       const elRect = (el as HTMLElement).getBoundingClientRect();
+      const elCenterX = elRect.left + elRect.width / 2;
       const elCenterY = elRect.top + elRect.height / 2;
 
-      // Already in the comfort zone — no scroll needed
-      if (elCenterY >= zoneTop && elCenterY <= zoneBottom) {
-        return { scrolled: false, fieldY: Math.round(elCenterY) };
+      const needsVertical = elCenterY < zoneTop || elCenterY > zoneBottom;
+      const needsHorizontal = elCenterX < zoneLeft || elCenterX > zoneRight;
+
+      if (!needsVertical && !needsHorizontal) {
+        return {
+          found: true,
+          scrolledV: false,
+          scrolledH: false,
+          fieldX: Math.round(elCenterX),
+          fieldY: Math.round(elCenterY),
+          needsH: false,
+          needsV: false,
+        };
       }
 
-      // Walk up to find the nearest scrollable ancestor
-      let scrollParent: Element | null = el.parentElement;
-      while (scrollParent) {
-        const style = window.getComputedStyle(scrollParent);
+      // Walk up to find scrollable ancestors for each axis
+      let vScrollParent: Element | null = null;
+      let hScrollParent: Element | null = null;
+      let ancestor: Element | null = el.parentElement;
+      while (ancestor && (!vScrollParent || !hScrollParent)) {
+        const style = window.getComputedStyle(ancestor);
         if (
+          !vScrollParent &&
           (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
-          scrollParent.scrollHeight > scrollParent.clientHeight
+          ancestor.scrollHeight > ancestor.clientHeight
         ) {
-          break;
+          vScrollParent = ancestor;
         }
-        scrollParent = scrollParent.parentElement;
+        if (
+          !hScrollParent &&
+          (style.overflowX === 'auto' ||
+            style.overflowX === 'scroll' ||
+            style.overflowX === 'hidden') &&
+          ancestor.scrollWidth > ancestor.clientWidth
+        ) {
+          hScrollParent = ancestor;
+        }
+        ancestor = ancestor.parentElement;
       }
 
-      if (!scrollParent) return { scrolled: false, fieldY: Math.round(elCenterY) };
+      let scrolledV = false;
+      let scrolledH = false;
 
-      // Scroll so the field ends up at the vertical center of the container
-      const parentRect = scrollParent.getBoundingClientRect();
-      const elCenterInContainer =
-        elRect.top - parentRect.top + scrollParent.scrollTop + elRect.height / 2;
-      const targetScrollTop = elCenterInContainer - scrollParent.clientHeight / 2;
-      scrollParent.scrollTo({ top: targetScrollTop, behavior: 'smooth' });
+      // Vertical scroll
+      if (needsVertical && vScrollParent) {
+        const parentRect = vScrollParent.getBoundingClientRect();
+        const elCenterInContainer =
+          elRect.top - parentRect.top + vScrollParent.scrollTop + elRect.height / 2;
+        const targetScrollTop = elCenterInContainer - vScrollParent.clientHeight / 2;
+        vScrollParent.scrollTo({ top: targetScrollTop, behavior: 'smooth' });
+        scrolledV = true;
+      }
 
-      return { scrolled: true, fieldY: Math.round(elCenterY) };
+      // Horizontal scroll — use direct scrollLeft assignment (scrollTo with
+      // behavior:'smooth' silently fails on overflow:hidden containers in Chromium).
+      // BC grids have paired header/data scroll containers under a common
+      // ms-nav-grid-horizontal-container; scroll ALL children so they stay in sync.
+      if (needsHorizontal && hScrollParent) {
+        const parentRect = hScrollParent.getBoundingClientRect();
+        const elCenterInContainer =
+          elRect.left - parentRect.left + hScrollParent.scrollLeft + elRect.width / 2;
+        const targetScrollLeft = Math.max(0, elCenterInContainer - hScrollParent.clientWidth / 2);
+
+        // Find the BC grid container ancestor that holds header + data scroll children
+        let gridContainer: Element | null = null;
+        let walk: Element | null = hScrollParent;
+        while (walk) {
+          if (walk.classList?.contains('ms-nav-grid-horizontal-container')) {
+            gridContainer = walk;
+            break;
+          }
+          walk = walk.parentElement;
+        }
+
+        if (gridContainer) {
+          // Scroll descendant DIVs that are actual scroll containers (not tiny
+          // TH/TD/BUTTON cells). The scrollable divs may be nested inside
+          // ms-nav-grid-vertical-container wrappers, so direct children alone
+          // aren't enough. Filter to DIVs with meaningful overflow (>50px).
+          for (const desc of Array.from(gridContainer.querySelectorAll('div'))) {
+            if (desc.scrollWidth - desc.clientWidth > 50) {
+              desc.scrollLeft = targetScrollLeft;
+            }
+          }
+        } else {
+          // Fallback: scroll the single hScrollParent directly
+          hScrollParent.scrollLeft = targetScrollLeft;
+        }
+        scrolledH = true;
+      }
+
+      return {
+        found: true,
+        scrolledV,
+        scrolledH,
+        fieldX: Math.round(elCenterX),
+        fieldY: Math.round(elCenterY),
+        needsH: needsHorizontal,
+        needsV: needsVertical,
+        hParentFound: !!hScrollParent,
+        vParentFound: !!vScrollParent,
+      };
     },
-    { name: fieldName, zoneTop: comfortZoneTop, zoneBottom: comfortZoneBottom },
+    {
+      name: fieldName,
+      zoneTop: comfortZoneTop,
+      zoneBottom: comfortZoneBottom,
+      zoneLeft: comfortZoneLeft,
+      zoneRight: comfortZoneRight,
+    },
   );
 
-  if (result?.scrolled) {
-    debug(`Scroll-to-center: field "${fieldName}" was at y=${result.fieldY}, centering...`);
+  if (result && !('found' in result && !result.found)) {
+    debug(
+      `Scroll-to-center: field "${fieldName}" at (${result.fieldX}, ${result.fieldY}), needsH=${result.needsH}, needsV=${result.needsV}, hParentFound=${result.hParentFound}, vParentFound=${result.vParentFound}`,
+    );
+  } else {
+    debug(`Scroll-to-center: field "${fieldName}" NOT FOUND in DOM`);
+  }
+
+  if (result?.scrolledV) {
+    debug(`Scroll-to-center: centering "${fieldName}" vertically`);
+  }
+  if (result?.scrolledH) {
+    debug(`Scroll-to-center: centering "${fieldName}" horizontally`);
+  }
+  if (result?.scrolledV || result?.scrolledH) {
     await page.waitForTimeout(500);
   }
 }
@@ -634,19 +762,26 @@ async function animateCursorToField(frame: Frame, page: Page, fieldName: string)
       return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
     }
 
-    // Strategy 1: Any element with matching aria-label
-    for (const el of document.querySelectorAll(`[aria-label*="${name}"]`)) {
+    // Strategy 1: BC grid cell — td[controlname] contains the input
+    for (const td of document.querySelectorAll(`td[controlname="${name}"]`)) {
+      const input = td.querySelector(
+        'input, textarea, select, [role="textbox"], [role="combobox"]',
+      );
+      if (input) {
+        const c = center(input);
+        if (c) return c;
+      }
+      const c = center(td);
+      if (c) return c;
+    }
+
+    // Strategy 2: Exact aria-label match
+    for (const el of document.querySelectorAll(`[aria-label="${name}"]`)) {
       const c = center(el);
       if (c) return c;
     }
 
-    // Strategy 2: Element with matching title attribute
-    for (const el of document.querySelectorAll(`[title*="${name}"]`)) {
-      const c = center(el);
-      if (c) return c;
-    }
-
-    // Strategy 3: Standard inputs + role="textbox" / role="combobox"
+    // Strategy 3: Input elements with substring aria-label match
     for (const el of document.querySelectorAll(
       'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]',
     )) {
@@ -656,7 +791,27 @@ async function animateCursorToField(frame: Frame, page: Page, fieldName: string)
       }
     }
 
-    // Strategy 4: Find caption text, target its sibling value element
+    // Strategy 4: Substring aria-label — pick shortest label (most specific match)
+    const candidates: Array<{ el: Element; len: number }> = [];
+    for (const el of document.querySelectorAll(`[aria-label*="${name}"]`)) {
+      if (el.getAttribute('aria-label')?.startsWith('Open menu for')) continue;
+      const c = center(el);
+      if (c) candidates.push({ el, len: el.getAttribute('aria-label')?.length ?? 0 });
+    }
+    if (candidates.length > 0) {
+      candidates.sort((a, b) => a.len - b.len);
+      const c = center(candidates[0].el);
+      if (c) return c;
+    }
+
+    // Strategy 5: Element with matching title attribute (skip "Open Menu" links)
+    for (const el of document.querySelectorAll(`[title*="${name}"]`)) {
+      if (el.getAttribute('title') === 'Open Menu') continue;
+      const c = center(el);
+      if (c) return c;
+    }
+
+    // Strategy 6: Find caption text, target its sibling value element
     for (const cap of document.querySelectorAll('label, [class*="caption"], [class*="Caption"]')) {
       if (cap.textContent?.trim() === name || cap.textContent?.includes(name)) {
         const parent = cap.parentElement;
