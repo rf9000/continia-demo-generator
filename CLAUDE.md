@@ -20,8 +20,11 @@ YAML spec → OpenAI TTS (per-step clips) → Vision investigation (screenshots 
 | Module | Purpose |
 |--------|---------|
 | `src/browser.ts` | Playwright browser launch, BC authentication, cookie transfer, `awaitBCFrame` |
-| `src/vision.ts` | Claude Sonnet 4.6 vision API client — locate, verify, prompt builders |
-| `src/investigator.ts` | See → act → verify loop — walks YAML steps, produces `.script.yml` |
+| `src/dom-extract.ts` | Pure function: Frame → cleaned HTML. Overlay detection, scroll state, layer awareness. |
+| `src/dom-interpreter.ts` | Claude text API for HTML interpretation. Survey, locate, confirm modes. |
+| `src/knowledge.ts` | Read/write knowledge bank YAML patterns. Self-learning from success/failure. |
+| `src/vision.ts` | Claude Sonnet 4.6 vision API — verify (before/after screenshots) and control add-in locate only |
+| `src/investigator.ts` | DOM-based 9-step loop: extract → survey → locate → prepare → confirm → act → verify → learn → emit |
 | `src/script-player.ts` | Coordinate-based recorder — replays `.script.yml` with cursor animation |
 | `src/script-types.ts` | Types for `.script.yml` format |
 | `src/script-io.ts` | Read/write `.script.yml`, spec hash, cache validation |
@@ -40,7 +43,7 @@ YAML spec → OpenAI TTS (per-step clips) → Vision investigation (screenshots 
 ## How it works
 
 1. **Audio-first**: TTS clips are generated per step BEFORE recording. Their durations determine video pacing.
-2. **Vision investigation**: A headless browser opens BC, and Claude Sonnet 4.6 locates each element via screenshots, producing a `.script.yml` with exact coordinates.
+2. **DOM investigation**: A headless browser opens BC, extracts cleaned HTML from the DOM, and Claude interprets the HTML to locate elements via CSS selectors. A knowledge bank of learned BC patterns improves accuracy over time. Vision (screenshots) is used only for action verification and control add-in fallback.
 3. **Environment reset**: BC environment is deleted and recreated between investigation and recording so data is fresh.
 4. **Coordinate replay**: The recording phase replays the `.script.yml` mechanically — clicking coordinates, typing values. No DOM queries.
 5. **Animated cursor**: A red dot glides to each click target with a ripple pulse effect.
