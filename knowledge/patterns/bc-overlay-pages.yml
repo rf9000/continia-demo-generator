@@ -1,0 +1,16 @@
+name: bc-overlay-pages
+description: BC opens records as modal overlay pages on top of list pages
+discovered: 2026-03-27
+successCount: 10
+lastUsed: 2026-03-27
+pattern:
+  identify: |
+    When opening a record from a list (clicking "New" or a row), BC often opens the card as a modal overlay.
+    The overlay appears as a second <form> element in the DOM, positioned on top of the list.
+    The list page remains in the DOM behind it but is non-interactive.
+    Multiple overlays can stack (e.g., list → card → lookup dialog).
+  interact: |
+    Always target elements in the TOPMOST/LAST form or dialog in the DOM.
+    When extracting HTML, identify which layer is active and only work with that layer.
+    Do NOT interact with background list elements — they're covered by the overlay.
+  verify: "The active overlay should contain the expected page title, action bar, and fields."

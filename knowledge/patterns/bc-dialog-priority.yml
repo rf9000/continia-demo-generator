@@ -1,0 +1,9 @@
+name: bc-dialog-priority
+description: Always interact with the topmost visible dialog, ignore background content
+discovered: 2026-03-27
+successCount: 10
+lastUsed: 2026-03-27
+pattern:
+  identify: "Dialogs/overlays: [role='dialog'], [class*='ms-nav-popup'], [class*='modal-dialog']. Ignore [class*='TeachingBubble'] (tooltips). The LAST visible dialog in DOM order is the topmost."
+  interact: "Always search inside the topmost visible dialog FIRST before searching the main page. For dialog buttons (OK, Cancel, Close, Yes, No), if no dialog is visible, the dialog likely already closed — skip the click."
+  verify: "After clicking a dialog button, the dialog should disappear from the DOM or become hidden."

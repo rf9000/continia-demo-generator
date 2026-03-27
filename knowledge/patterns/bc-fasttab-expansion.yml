@@ -1,0 +1,17 @@
+name: bc-fasttab-expansion
+description: How to expand collapsed FastTab sections to reveal hidden fields
+discovered: 2026-03-27
+successCount: 10
+lastUsed: 2026-03-27
+pattern:
+  identify: |
+    FastTab headers have aria-expanded="true" or "false" and a caption text.
+    Container classes: collapsibleTab, collapsibleTab-container.
+    IMPORTANT: When a FastTab is collapsed, BC does NOT render its child fields in the DOM at all.
+    You must expand the FastTab first, then re-read the DOM to find the fields.
+  interact: |
+    Click the FastTab header element (the one with aria-expanded="false") to expand it.
+    After expanding, wait for BC to become idle, then re-extract the DOM — the fields will now be present.
+    If fields are still hidden after expanding, look for "Show more" / "Vis mere" / "Mehr anzeigen" links
+    SCOPED to that FastTab's container (not the whole page).
+  verify: "aria-expanded should change from 'false' to 'true', and child field elements should appear in the DOM."

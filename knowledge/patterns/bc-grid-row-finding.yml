@@ -1,0 +1,16 @@
+name: bc-grid-row-finding
+description: How to find and click rows in BC list grids
+discovered: 2026-03-27
+successCount: 10
+lastUsed: 2026-03-27
+pattern:
+  identify: |
+    Grid tables: table.ms-nav-grid-data-table, table[class*='ms-nav-grid'][class*='data'], or [role='grid'].
+    If a dialog is open, scope to the dialog's grid first.
+    Iterate tables in REVERSE order (edit-mode grid is the last one in DOM order).
+    Data rows: tbody > tr or [role='row'], excluding rows with th/[role='columnheader'] and empty rows.
+  interact: |
+    By index (1-based): click the Nth data row's first td or link element.
+    By text: scan all cells in each row for case-insensitive text match, click the first matching row.
+    Prefer clicking an <a> link inside the row if available, otherwise click the first <td>.
+  verify: "After clicking a row in a list, a card/detail page should open (page type changes from list to card)."

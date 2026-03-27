@@ -9,6 +9,8 @@ export interface DemoConfig {
   bcPasswordKey?: string;
   outputDir: string;
   headed: boolean;
+  anthropicApiKey?: string;
+  visionModel: string;
 }
 
 export function loadConfig(overrides?: Partial<DemoConfig>): DemoConfig {
@@ -20,5 +22,7 @@ export function loadConfig(overrides?: Partial<DemoConfig>): DemoConfig {
     bcPasswordKey: overrides?.bcPasswordKey ?? process.env['BC_PASSWORD_KEY'],
     outputDir: overrides?.outputDir ?? process.env['OUTPUT_DIR'] ?? './output',
     headed: overrides?.headed ?? true,
+    anthropicApiKey: overrides?.anthropicApiKey ?? process.env['ANTHROPIC_API_KEY'],
+    visionModel: overrides?.visionModel ?? 'claude-sonnet-4-6',
   };
 }

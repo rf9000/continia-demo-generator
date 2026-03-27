@@ -1,0 +1,9 @@
+name: bc-edit-mode-duplicates
+description: BC edit mode renders duplicate elements — always use the LAST visible match
+discovered: 2026-03-27
+successCount: 10
+lastUsed: 2026-03-27
+pattern:
+  identify: "When BC enters edit mode, it renders a second set of grids, fields, and buttons on top of the view-mode content WITHOUT wrapping them in [role='dialog']. Both sets stay in the DOM."
+  interact: "For every element query, always target the LAST visible match in document order, not the first. Use .last() in Playwright locators."
+  verify: "If clicking the first match does nothing, the edit-mode duplicate is likely below it — try the last match."

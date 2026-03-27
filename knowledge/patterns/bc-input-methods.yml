@@ -1,0 +1,19 @@
+name: bc-input-methods
+description: How to fill different types of BC input fields
+discovered: 2026-03-27
+successCount: 10
+lastUsed: 2026-03-27
+pattern:
+  identify: |
+    BC has different input element types:
+    - Text/number: input[type="text"], [role="textbox"], [role="combobox"]
+    - Boolean: input[type="checkbox"], [role="checkbox"]
+    - Password/concealed: input[type="password"] (e.g., IBAN fields)
+    - Dropdown: [role="combobox"] with aria-haspopup
+  interact: |
+    Standard text fields: click to focus, then fill() or type(), then Tab to confirm.
+    Boolean fields: find the checkbox, compare current state, click to toggle if needed.
+    Combobox/dropdown: click to focus, type the value, then Tab (BC auto-matches).
+    Concealed fields (password type): same as text — click, fill, Tab.
+    If direct fill fails: fall back to click → Ctrl+A → type → Tab.
+  verify: "After Tab, the field's value attribute or displayed text should match the typed value. For concealed fields, the value shows as dots but is stored correctly."

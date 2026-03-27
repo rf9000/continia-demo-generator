@@ -1,0 +1,22 @@
+name: bc-action-button-strategies
+description: Priority chain for finding and clicking BC action buttons
+discovered: 2026-03-27
+successCount: 10
+lastUsed: 2026-03-27
+pattern:
+  identify: |
+    Action buttons exist in these locations (check in order):
+    1. Inside the topmost visible dialog (role="dialog")
+    2. Action bar / inline command bar — button[role="menuitem"]
+    3. Dropdown/popup menus — [class*="ms-nav-popup"] menuitem
+    4. Content area links/buttons
+    5. Top bar (main page frame, outside BC iframe)
+  interact: |
+    Use Playwright locators in this priority:
+    1. frame.getByRole('menuitem', { name: caption, exact: true }).last()
+    2. frame.getByRole('button', { name: caption, exact: true }).last()
+    3. frame.getByRole('link', { name: caption, exact: true }).last()
+    4. frame.getByRole('menuitem', { name: caption }).last() — partial match
+    5. frame.getByText(caption, { exact: true }).last()
+    Always use .last() because edit-mode renders duplicates.
+  verify: "After clicking an action, the page should change visibly — a new page opens, a dialog appears, a menu shows, or the current page updates."
