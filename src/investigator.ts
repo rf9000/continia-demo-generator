@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { resolve, parse as parsePath } from 'path';
 import { parse as parseYaml } from 'yaml';
 import type { Page } from 'playwright';
-import { VisionClient } from './vision.js';
+import { VisionClient, type PageSurvey } from './vision.js';
 import { launchBCSession, closeBCSession, awaitBCFrame } from './browser.js';
 import { computeSpecHash, writeScript } from './script-io.js';
 import type {
@@ -18,6 +18,8 @@ import { info, debug } from './log.js';
 
 const MAX_RETRIES = 3;
 const POST_ACTION_WAIT_MS = 4000;
+const SURVEY_SCROLL_STEPS = 4; // number of scroll positions to capture
+const SURVEY_SCROLL_PX = 400; // pixels to scroll per step
 
 interface YamlSpec {
   description?: string;
@@ -66,6 +68,129 @@ async function captureScreenshot(page: Page, outputDir: string, name: string): P
   const path = resolve(outputDir, name);
   writeFileSync(path, buffer);
   return buffer;
+}
+
+/**
+ * Surveys the current BC page by expanding all FastTabs, scrolling through,
+ * and taking screenshots at multiple positions. Returns a structured description
+ * of the COMPLETE page layout including all fields in all sections.
+ */
+async function surveyCurrentPage(
+  vision: VisionClient,
+  page: Page,
+  outputDir: string,
+  label: string,
+): Promise<PageSurvey> {
+  // Step 1: On card/document pages, expand collapsed FastTabs and "Show more"
+  // so the survey sees every field. Skip this on list pages to avoid navigating away.
+  try {
+    const frame = await awaitBCFrame(page, 5_000);
+    const hasCardForm = await frame.evaluate(
+      () =>
+        !!document.querySelector(
+          'div.ms-nav-cardform, [class*="ms-nav-card"], [class*="collapsibleTab"]',
+        ),
+    );
+
+    if (hasCardForm) {
+      // Expand collapsed FastTabs (scoped to the card form area)
+      const expandedCount = await frame.evaluate(() => {
+        let count = 0;
+        const cardForm =
+          document.querySelector('div.ms-nav-cardform, [class*="ms-nav-card"]') ?? document.body;
+        for (const header of cardForm.querySelectorAll('[aria-expanded="false"]')) {
+          const rect = (header as HTMLElement).getBoundingClientRect();
+          if (rect.width > 100 && rect.height > 10 && rect.height < 60) {
+            (header as HTMLElement).click();
+            count++;
+          }
+        }
+        return count;
+      });
+      if (expandedCount > 0) {
+        info(`  Expanded ${expandedCount} collapsed FastTab(s)`);
+        await page.waitForTimeout(1500);
+        try {
+          await awaitBCFrame(page, 5_000);
+        } catch {
+          /* */
+        }
+      }
+
+      // Click "Show more" links
+      const showMoreCount = await frame.evaluate(() => {
+        let count = 0;
+        for (const el of document.querySelectorAll('a, button, [role="button"], span')) {
+          const text = (el as HTMLElement).innerText?.trim().toLowerCase();
+          if (text === 'show more' || text === 'vis mere' || text === 'mehr anzeigen') {
+            const rect = (el as HTMLElement).getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+              (el as HTMLElement).click();
+              count++;
+            }
+          }
+        }
+        return count;
+      });
+      if (showMoreCount > 0) {
+        info(`  Clicked ${showMoreCount} "Show more" link(s)`);
+        await page.waitForTimeout(1000);
+        try {
+          await awaitBCFrame(page, 5_000);
+        } catch {
+          /* */
+        }
+      }
+    } else {
+      debug('  Not a card page — skipping FastTab expansion');
+    }
+  } catch {
+    /* non-critical */
+  }
+
+  // Step 3: Scroll to top
+  try {
+    const frame = await awaitBCFrame(page, 5_000);
+    await frame.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(300);
+  } catch {
+    /* non-critical */
+  }
+
+  // Step 4: Capture screenshots at multiple scroll positions
+  const screenshots: Buffer[] = [];
+  for (let i = 0; i <= SURVEY_SCROLL_STEPS; i++) {
+    const buf = await captureScreenshot(page, outputDir, `survey-${label}-scroll${i}.png`);
+    screenshots.push(buf);
+
+    if (i < SURVEY_SCROLL_STEPS) {
+      await page.mouse.wheel(0, SURVEY_SCROLL_PX);
+      await page.waitForTimeout(500);
+    }
+  }
+
+  // Step 5: Scroll back to top for subsequent steps
+  try {
+    const frame = await awaitBCFrame(page, 5_000);
+    await frame.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(300);
+  } catch {
+    /* non-critical */
+  }
+
+  // Step 6: Send all screenshots to vision model for analysis
+  const survey = await vision.surveyPage(screenshots);
+  info(`  Page survey: ${survey.pageType} "${survey.pageTitle}"`);
+  info(
+    `  FastTabs: ${survey.fastTabs.map((ft) => `${ft.name}(${ft.expanded ? 'open' : 'closed'}, ${ft.fields.length} fields)`).join(', ')}`,
+  );
+  for (const ft of survey.fastTabs) {
+    if (ft.fields.length > 0) {
+      info(`    ${ft.name}: ${ft.fields.join(', ')}`);
+    }
+  }
+
+  return survey;
 }
 
 /**
@@ -140,6 +265,7 @@ async function investigateStep(
   stepIndex: number,
   outputDir: string,
   skipVerify: boolean,
+  pageSurvey?: PageSurvey,
 ): Promise<ScriptStep> {
   let lastLocate: LocateResult | null = null;
   const pad = String(stepIndex).padStart(2, '0');
@@ -156,8 +282,10 @@ async function investigateStep(
       `step-${pad}-before${attempt > 0 ? `-retry${attempt}` : ''}.png`,
     );
 
-    // LOCATE
-    const locateResult = await vision.locate(beforeBuf, source);
+    // LOCATE — use page survey context if available for more accurate results
+    const locateResult = pageSurvey
+      ? await vision.locateWithContext(beforeBuf, source, pageSurvey)
+      : await vision.locate(beforeBuf, source);
     lastLocate = locateResult;
     info(
       `  → ${locateResult.element} at (${locateResult.coordinates.x}, ${locateResult.coordinates.y}) [confidence: ${locateResult.confidence}]`,
@@ -186,7 +314,9 @@ async function investigateStep(
         outputDir,
         `step-${pad}-after-prep${attempt > 0 ? `-retry${attempt}` : ''}.png`,
       );
-      const reLocate = await vision.locate(afterPrepBuf, source);
+      const reLocate = pageSurvey
+        ? await vision.locateWithContext(afterPrepBuf, source, pageSurvey)
+        : await vision.locate(afterPrepBuf, source);
       lastLocate = reLocate;
       info(
         `  → Re-located: (${reLocate.coordinates.x}, ${reLocate.coordinates.y}) [confidence: ${reLocate.confidence}]`,
@@ -340,6 +470,11 @@ export async function investigate(
       }
     }
 
+    // Survey the initial page
+    let currentSurvey: PageSurvey | undefined;
+    info('Surveying initial page...');
+    currentSurvey = await surveyCurrentPage(vision, session.page, screenshotDir, 'initial');
+
     for (let i = 0; i < linearSteps.length; i++) {
       const { step } = linearSteps[i];
       const source = toSource(step);
@@ -353,8 +488,24 @@ export async function investigate(
         i,
         screenshotDir,
         options.skipVerify ?? false,
+        currentSurvey,
       );
       scriptSteps.push(scriptStep);
+
+      // If the step verified a page change, re-survey the new page
+      if (
+        scriptStep.verification.success &&
+        scriptStep.verification.afterPage &&
+        scriptStep.verification.beforePage !== scriptStep.verification.afterPage
+      ) {
+        info('Page changed — surveying new page...');
+        currentSurvey = await surveyCurrentPage(
+          vision,
+          session.page,
+          screenshotDir,
+          `after-step${i}`,
+        );
+      }
     }
   } finally {
     await closeBCSession(session);
