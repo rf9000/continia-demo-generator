@@ -73,7 +73,10 @@ export async function launchBCSession(
   }
 
   const headless = options.headless ?? !config.headed;
-  const browser = await chromium.launch({ headless });
+  const browser = await chromium.launch({
+    headless,
+    args: headless ? ['--disable-gpu'] : [],
+  });
 
   // Phase A: Authenticate in a non-recording context
   debug(`Navigating to: ${bcUrl.toString()}`);

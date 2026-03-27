@@ -22,6 +22,8 @@ export interface LocateResult {
 /** Result from the vision model's verify call. */
 export interface VerifyResult {
   success: boolean;
+  beforePage?: string;
+  afterPage?: string;
   observation: string;
   newState?: string;
 }

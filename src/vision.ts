@@ -5,52 +5,96 @@ import type { ScriptStepSource } from './script-types.js';
 import { debug } from './log.js';
 
 const SYSTEM_PROMPT = `You are a UI automation agent navigating a Microsoft Dynamics 365 Business Central (BC) web client.
-The viewport is 1920x1080 pixels.
-Return coordinates as {"x": <number>, "y": <number>} relative to the top-left corner of the viewport.
-If the element is not visible, describe what preparation is needed (scroll, expand section, wait) in the "prep" array.
-If the element is inside a control add-in (custom embedded widget/iframe), still provide coordinates based on its visual position.
+
+## Viewport & Coordinates
+- The viewport is 1920x1080 pixels.
+- Return coordinates as {"x": <number>, "y": <number>} relative to the top-left corner of the viewport.
+- Be PRECISE with coordinates. Aim for the CENTER of the target element. A button at x=370..390 should return x=380, not x=400.
+
+## BC Page Structure
+BC pages have these layers from top to bottom:
+1. **Header bar** (dark blue, ~17px) — Dynamics 365 Business Central branding
+2. **Navigation bar** (~40px) — Company name, menu items (Finance, Sales, etc.)
+3. **Action bar** (~30px) — Page-specific buttons (New, Delete, Edit, Process, etc.)
+4. **Notification bar** (optional, ~30px) — Blue/yellow info banners. These do NOT block interaction — content is pushed below them.
+5. **Content area** — The actual page data (cards, lists, grids, fields)
+
+## BC Page Types
+- **List page**: Shows a grid/table of records. Action bar has New, Delete, etc.
+- **Card page**: Shows a single record with FastTabs (collapsible sections) containing fields.
+- **Document page**: Card with an embedded grid (header fields + line items).
+
+## Important Behaviors
+- Clicking "New" on a list page should navigate to a NEW blank card page.
+- Clicking a row in a list opens that record's card page.
+- Notification banners are informational — they don't block page changes.
+- If a control add-in (custom iframe widget) is visible, provide coordinates based on visual position.
+
 Always respond with ONLY a JSON object — no markdown, no explanation outside the JSON.`;
 
 /** Builds the user prompt for a locate call (action or row step). */
 export function buildLocatePrompt(source: ScriptStepSource): string {
+  const responseFormat = `Respond with JSON: { "element": "<description>", "coordinates": {"x": <n>, "y": <n>}, "confidence": <0-1>, "prep": [<prep actions if needed>], "observation": "<describe the current page: what type of page, what elements are visible, where the target is>" }
+
+Prep action format: { "action": "scroll"|"click"|"wait", "coordinates": {"x":<n>,"y":<n>}, "direction": "up"|"down"|"left"|"right", "px": <n>, "ms": <n>, "reason": "<why>" }
+
+IMPORTANT: Describe what type of BC page you see (list, card, document, dialog) and what page it is (e.g., "Bank Accounts list", "Bank Account Card"). This helps track navigation.`;
+
   if (source.type === 'action' && source.assistEdit) {
     return `Find the field labeled "${source.caption}" on this Business Central page. I need to click its assist-edit "..." button. Return the coordinates of the field's value area (clicking it will reveal the "..." button).
 
-Respond with JSON: { "element": "<description>", "coordinates": {"x": <n>, "y": <n>}, "confidence": <0-1>, "prep": [<prep actions if needed>], "observation": "<what you see>" }
+The field should be on a Card or Document page, inside a FastTab section. If the field is not visible, it may be in a collapsed FastTab or below the fold — describe what prep is needed.
 
-Prep action format: { "action": "scroll"|"click"|"wait", "coordinates": {"x":<n>,"y":<n>}, "direction": "up"|"down"|"left"|"right", "px": <n>, "ms": <n>, "reason": "<why>" }`;
+${responseFormat}`;
   }
 
   if (source.type === 'action' && source.row != null) {
     const rowDesc =
       typeof source.row === 'number'
-        ? `row number ${source.row} (1-indexed from top)`
-        : `the row containing the text "${source.row}"`;
-    return `Find ${rowDesc} in the data grid/list on this Business Central page. Return the coordinates to click on that row to open it.
+        ? `row number ${source.row} (1-indexed from top, counting only DATA rows with content, not header rows)`
+        : `the row containing the text "${source.row}" in any cell`;
+    return `Find ${rowDesc} in the data grid/list on this Business Central page. Return the coordinates to click on that row (aim for the first text cell with content).
 
-Respond with JSON: { "element": "<description>", "coordinates": {"x": <n>, "y": <n>}, "confidence": <0-1>, "prep": [<prep actions if needed>], "observation": "<what you see>" }`;
+Clicking a row on a list page should open that record's card/detail page.
+
+${responseFormat}`;
   }
 
   if (source.type === 'action' && source.caption) {
-    return `Find the button, menu item, or action labeled "${source.caption}" on this Business Central page. Return its coordinates so I can click it.
+    return `Find the button, menu item, or action labeled "${source.caption}" on this Business Central page.
 
-Respond with JSON: { "element": "<description>", "coordinates": {"x": <n>, "y": <n>}, "confidence": <0-1>, "prep": [<prep actions if needed>], "observation": "<what you see>" }
+Look for it in these locations (in order):
+1. The action bar (toolbar row below the navigation bar) — buttons like "+ New", "Delete", "Edit", "Post"
+2. Menu items in an open dropdown
+3. Dialog buttons (OK, Cancel, Yes, No)
+4. Links or buttons in the content area
 
-Prep action format: { "action": "scroll"|"click"|"wait", "coordinates": {"x":<n>,"y":<n>}, "direction": "up"|"down"|"left"|"right", "px": <n>, "ms": <n>, "reason": "<why>" }`;
+The text "${source.caption}" should match the visible label. In BC, the "New" button often shows as "+ New".
+
+Return the EXACT center coordinates of the clickable element.
+
+${responseFormat}`;
   }
 
-  return `Describe what you see on this Business Central page and identify any interactive elements.
+  return `Describe what you see on this Business Central page.
 
-Respond with JSON: { "element": "unknown", "coordinates": {"x": 0, "y": 0}, "confidence": 0, "prep": [], "observation": "<what you see>" }`;
+${responseFormat}`;
 }
 
 /** Builds the user prompt for an input locate call. */
 export function buildInputPrompt(source: ScriptStepSource): string {
   return `Find the input field labeled "${source.field}" on this Business Central page. I need to click on it and type "${source.value}".
 
-Return the coordinates of the field's input area (where I should click to focus it, then type).
+BC fields on Card pages are laid out as "Caption: [Value]" pairs inside FastTab sections. The input area is the value part (right side). Look for the field label "${source.field}" and return the coordinates of its VALUE/INPUT area.
 
-Respond with JSON: { "element": "<description>", "coordinates": {"x": <n>, "y": <n>}, "confidence": <0-1>, "prep": [<prep actions if needed>], "observation": "<what you see>" }
+If the field is not visible:
+- It may be in a collapsed FastTab — describe which FastTab to expand
+- It may be below the fold — describe scrolling needed
+- It may be on a DIFFERENT page than what's currently shown — describe what's wrong
+
+IMPORTANT: First identify what page you're on. If this is a list page but the field belongs on a card page, the confidence should be very low and you should explain that we're on the wrong page.
+
+Respond with JSON: { "element": "<description>", "coordinates": {"x": <n>, "y": <n>}, "confidence": <0-1>, "prep": [<prep actions if needed>], "observation": "<describe the current page type and what you see>" }
 
 Prep action format: { "action": "scroll"|"click"|"wait", "coordinates": {"x":<n>,"y":<n>}, "direction": "up"|"down"|"left"|"right", "px": <n>, "ms": <n>, "reason": "<why>" }`;
 }
@@ -67,14 +111,39 @@ export function buildVerifyPrompt(
         ? `clicked row "${source.row}"`
         : `clicked "${source.caption}" at (${coordinates.x}, ${coordinates.y})`;
 
+  // Build expected outcome based on the action type
+  let expectedOutcome = '';
+  if (source.type === 'action' && source.caption === 'New') {
+    expectedOutcome = `Expected outcome: A NEW blank card/edit page should have opened. The page title and action bar should be different from the before screenshot. A notification banner appearing is NOT sufficient — the page layout itself must change.`;
+  } else if (source.type === 'action' && source.caption === 'OK') {
+    expectedOutcome = `Expected outcome: A dialog should have closed, or the page should have navigated back.`;
+  } else if (source.type === 'action' && source.row != null) {
+    expectedOutcome = `Expected outcome: A card/detail page for that record should have opened. The page layout should change from a list to a card with fields.`;
+  } else if (source.type === 'input') {
+    expectedOutcome = `Expected outcome: The field "${source.field}" should now show the value "${source.value}".`;
+  } else if (source.type === 'action' && source.caption) {
+    expectedOutcome = `Expected outcome: The action "${source.caption}" should have triggered a visible change — a menu opened, a page navigated, a dialog appeared, or a process started.`;
+  }
+
   return `I just ${actionDesc} on this Business Central page.
 
-Compare the two screenshots (before and after) and tell me if the action was successful.
+Compare the BEFORE screenshot (first image) and AFTER screenshot (second image) carefully.
 
-Signs of success: a new page/dialog opened, a field value changed, a menu appeared, a confirmation message showed, the page navigated.
-Signs of failure: nothing changed, an error message appeared, the wrong element was clicked.
+${expectedOutcome}
 
-Respond with JSON: { "success": <true|false>, "observation": "<what changed or didn't>", "newState": "<optional: dialog-open, page-navigated, etc>" }`;
+IMPORTANT verification rules:
+- A notification banner appearing (blue/yellow bar) is NOT a page change. Notifications are informational overlays.
+- For "New" and row-click actions: the PAGE TYPE must change (e.g., from list to card). Same page with a notification = FAILED.
+- For input actions: the field's visible value must match what was typed.
+- Identify the page type in BOTH screenshots (list, card, document, dialog).
+
+Respond with JSON: {
+  "success": <true|false>,
+  "observation": "<describe what changed between before and after>",
+  "beforePage": "<page type and name in the before screenshot>",
+  "afterPage": "<page type and name in the after screenshot>",
+  "newState": "<optional: dialog-open, page-navigated, card-opened, etc>"
+}`;
 }
 
 /** Extracts JSON from a model response that may be wrapped in markdown code fences. */
@@ -115,6 +184,8 @@ export function parseVerifyResponse(text: string): VerifyResult {
   const json = JSON.parse(extractJson(text));
   return {
     success: json.success === true,
+    beforePage: json.beforePage,
+    afterPage: json.afterPage,
     observation: json.observation ?? '',
     newState: json.newState,
   };

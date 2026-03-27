@@ -17,7 +17,7 @@ import { DemoConfig } from './config.js';
 import { info, debug } from './log.js';
 
 const MAX_RETRIES = 3;
-const POST_ACTION_WAIT_MS = 2000;
+const POST_ACTION_WAIT_MS = 4000;
 
 interface YamlSpec {
   description?: string;
@@ -68,6 +68,55 @@ async function captureScreenshot(page: Page, outputDir: string, name: string): P
   return buffer;
 }
 
+/**
+ * Clicks an element in BC by caption/label using Playwright locators on the frame.
+ * Vision coordinates can be imprecise (off by 50-100px), so we use the element's
+ * text content to find it via Playwright's locator API which clicks the exact center.
+ * Falls back to page.mouse.click() at the given coordinates if no label is available.
+ */
+async function clickByLabel(
+  page: Page,
+  label: string | undefined,
+  pageX: number,
+  pageY: number,
+): Promise<void> {
+  if (label) {
+    try {
+      const frame = await awaitBCFrame(page, 5_000);
+      // Try role-based locators first (most reliable for BC actions)
+      for (const role of ['menuitem', 'button', 'link'] as const) {
+        const loc = frame.getByRole(role, { name: label, exact: true });
+        if ((await loc.count()) > 0) {
+          await loc.last().click();
+          debug(`  Clicked [${role}] "${label}" via locator`);
+          return;
+        }
+      }
+      // Try partial match
+      for (const role of ['menuitem', 'button', 'link'] as const) {
+        const loc = frame.getByRole(role, { name: label });
+        if ((await loc.count()) > 0) {
+          await loc.last().click();
+          debug(`  Clicked [${role}] ~"${label}" via partial locator`);
+          return;
+        }
+      }
+      // Try getByText
+      const textLoc = frame.getByText(label, { exact: true });
+      if ((await textLoc.count()) > 0) {
+        await textLoc.last().click();
+        debug(`  Clicked text "${label}" via locator`);
+        return;
+      }
+    } catch {
+      // Fall through to coordinate click
+    }
+  }
+  // Fallback: coordinate click
+  debug(`  Clicking at coordinates (${pageX}, ${pageY})`);
+  await page.mouse.click(pageX, pageY);
+}
+
 /** Executes a prep action (scroll, click, wait) on the page. */
 async function executePrepAction(page: Page, prep: PrepAction): Promise<void> {
   if (prep.action === 'scroll' && prep.direction && prep.px) {
@@ -114,12 +163,8 @@ async function investigateStep(
       `  → ${locateResult.element} at (${locateResult.coordinates.x}, ${locateResult.coordinates.y}) [confidence: ${locateResult.confidence}]`,
     );
 
-    if (locateResult.confidence < 0.3) {
-      info(`  Confidence too low (${locateResult.confidence}), retrying...`);
-      continue;
-    }
-
-    // PREP
+    // PREP — execute prep actions even if confidence is low, because the model
+    // may be saying "element isn't visible yet, do this first" (scroll, expand, etc.)
     if (locateResult.prep.length > 0) {
       debug(`  Executing ${locateResult.prep.length} prep actions...`);
       for (const prep of locateResult.prep) {
@@ -127,8 +172,20 @@ async function investigateStep(
         await executePrepAction(page, prep);
       }
 
+      // Wait for BC to settle after prep
+      await page.waitForTimeout(500);
+      try {
+        await awaitBCFrame(page, 5_000);
+      } catch {
+        /* non-critical */
+      }
+
       // Re-locate after prep changed the page
-      const afterPrepBuf = await captureScreenshot(page, outputDir, `step-${pad}-after-prep.png`);
+      const afterPrepBuf = await captureScreenshot(
+        page,
+        outputDir,
+        `step-${pad}-after-prep${attempt > 0 ? `-retry${attempt}` : ''}.png`,
+      );
       const reLocate = await vision.locate(afterPrepBuf, source);
       lastLocate = reLocate;
       info(
@@ -136,18 +193,28 @@ async function investigateStep(
       );
     }
 
-    // ACT
+    // Skip action if confidence is still too low after prep
+    if (lastLocate.confidence < 0.3) {
+      info(`  Confidence too low (${lastLocate.confidence}), retrying...`);
+      continue;
+    }
+
+    // ACT — use clickByLabel() which finds elements via Playwright locators
+    // for precise clicking, falling back to coordinates if no label is available
     const coords = lastLocate.coordinates;
+    const label = source.caption ?? source.field;
+
     if (source.type === 'input' && source.value) {
-      await page.mouse.click(coords.x, coords.y);
+      // For input fields: click the field by label, then type
+      await clickByLabel(page, source.field, coords.x, coords.y);
       await page.waitForTimeout(300);
-      await page.mouse.click(coords.x, coords.y, { clickCount: 3 });
+      // Select all and type over
+      await page.keyboard.press('Control+a');
       await page.waitForTimeout(100);
       await page.keyboard.type(source.value, { delay: 50 });
       await page.keyboard.press('Tab');
     } else if (source.assistEdit) {
-      // Click field to focus, wait for assist button, then find and click it
-      await page.mouse.click(coords.x, coords.y);
+      await clickByLabel(page, source.caption, coords.x, coords.y);
       await page.waitForTimeout(600);
       const assistBuf = await captureScreenshot(page, outputDir, `step-${pad}-assist.png`);
       const assistSource: ScriptStepSource = {
@@ -160,8 +227,11 @@ async function investigateStep(
       } else {
         await page.keyboard.press('F6');
       }
-    } else {
+    } else if (source.row != null) {
+      // For row clicks: use coordinates (no text label to match)
       await page.mouse.click(coords.x, coords.y);
+    } else {
+      await clickByLabel(page, label, coords.x, coords.y);
     }
 
     await page.waitForTimeout(POST_ACTION_WAIT_MS);
