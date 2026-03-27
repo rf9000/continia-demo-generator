@@ -6,6 +6,9 @@ import { DemoConfig } from './config.js';
 import { injectCursor, cursorClickLocator, cursorClickAt, animateCursorTo } from './cursor.js';
 import { info, debug, cleanDescription } from './log.js';
 import type { PageType, AccessPathStep, StepDiscovery } from './types.js';
+import { DomInterpreter, type DomAdvice, type StepSource } from './dom-interpreter.js';
+import { extractPageHtml } from './dom-extract.js';
+import { loadPatterns } from './knowledge.js';
 
 export interface Recording {
   description: string;
@@ -669,6 +672,16 @@ export async function playDemo(
 
     const timingSteps: StepTimingEntry[] = [];
 
+    // Initialize DOM interpreter as co-pilot (optional — only if Anthropic API key is available)
+    const knowledgeDir = resolve('knowledge', 'patterns');
+    const domInterpreter = config.anthropicApiKey
+      ? new DomInterpreter(config.anthropicApiKey, config.visionModel)
+      : null;
+    const knowledgePatterns = domInterpreter ? loadPatterns(knowledgeDir) : [];
+    if (domInterpreter) {
+      debug(`DOM co-pilot active (${knowledgePatterns.length} knowledge patterns loaded)`);
+    }
+
     // Take a snapshot to see what's on the page (verbose only)
     const snapshot = await frame.evaluate(() => {
       const buttons: string[] = [];
@@ -742,6 +755,53 @@ export async function playDemo(
         stepDiscovery.pageType = await detectPageType(currentFrame);
       } catch {
         /* non-critical */
+      }
+
+      // DOM co-pilot: ask the interpreter for advice before running strategies
+      let domAdvice: DomAdvice | undefined;
+      if (domInterpreter) {
+        try {
+          const { html } = await extractPageHtml(currentFrame);
+          const stepSource: StepSource = {
+            type: step.type,
+            caption: step.caption,
+            field: step.target?.find((t) => t.field)?.field,
+            value: step.value,
+            row: step.row,
+            assistEdit: step.assistEdit,
+          };
+          domAdvice = await domInterpreter.advise(html, stepSource, knowledgePatterns);
+          debug(
+            `  DOM advice: ${domAdvice.pageType} "${domAdvice.pageTitle}" — ${domAdvice.reasoning.slice(0, 150)}`,
+          );
+
+          // Execute preparation steps (expand FastTabs, scroll, Show more)
+          if (domAdvice.preparation.length > 0) {
+            info(`  DOM co-pilot: ${domAdvice.preparation.length} prep step(s) needed`);
+            for (const prep of domAdvice.preparation) {
+              debug(`    ${prep.action}: ${prep.selector} — ${prep.reason}`);
+              try {
+                await currentFrame.locator(prep.selector).click();
+                await page.waitForTimeout(500);
+                await awaitBCFrame(page, 10_000).catch(() => {});
+              } catch (err) {
+                debug(
+                  `    Prep failed: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`,
+                );
+              }
+            }
+            // Re-acquire frame after preparation may have changed page state
+            try {
+              currentFrame = await awaitBCFrame(page, 10_000);
+            } catch {
+              /* keep current frame */
+            }
+          }
+        } catch (err) {
+          debug(
+            `  DOM co-pilot error: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`,
+          );
+        }
       }
 
       // In record mode with enrichments: pre-execute access path
@@ -906,6 +966,26 @@ export async function playDemo(
               debug(`DOM elements with "show/more/column": ${allText.join('\n    ')}`);
 
               clicked = await clickBCAction(currentFrame, page, step.caption);
+            }
+          }
+
+          if (!clicked && domAdvice?.suggestedSelector) {
+            // DOM interpreter fallback: try the suggested selector
+            info(`  Trying DOM interpreter selector: ${domAdvice.suggestedSelector}`);
+            try {
+              const loc = currentFrame.locator(domAdvice.suggestedSelector);
+              if ((await loc.count()) > 0) {
+                if (!isInvestigate) {
+                  const box = await loc.last().boundingBox();
+                  if (box)
+                    await animateCursorTo(page, box.x + box.width / 2, box.y + box.height / 2);
+                }
+                await loc.last().click();
+                clicked = true;
+                info(`  Clicked via DOM interpreter selector`);
+              }
+            } catch {
+              debug(`  DOM interpreter selector failed`);
             }
           }
 

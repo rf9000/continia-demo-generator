@@ -12,21 +12,70 @@ export interface StepSource {
   assistEdit?: boolean;
 }
 
-const SYSTEM_PROMPT = `You are interpreting the HTML DOM of a Microsoft Dynamics 365 Business Central (BC) web client page.
+const SYSTEM_PROMPT = `You are an expert Business Central (BC) DOM navigator. You interpret cleaned HTML from BC's web client and return precise CSS selectors and interaction instructions.
 
-You receive cleaned HTML that has been stripped of scripts, styles, and decorative elements. What remains is the semantic structure: elements with roles, aria-labels, controlnames, and text content.
+## Your Role
+You act as a co-pilot for a Playwright-based automation system. You read the page HTML and advise:
+1. What page/state we're on
+2. Where target elements are (or what needs to happen first to reveal them)
+3. Exact CSS selectors that Playwright can use
 
-## BC Page Structure in the DOM
-- **List pages**: Contain a grid/table with rows of records. Action bar has menuitem buttons.
-- **Card pages**: Contain FastTab sections (\`<section aria-expanded="true|false" aria-label="...">\`) with field pairs (\`<div controlname="FieldName"><input value="..."/></div>\`).
-- **Overlays**: BC opens cards as modal overlays. The HTML will be annotated with \`<!-- ACTIVE LAYER -->\` comments. Always work with the active layer.
-- **Scroll state**: Annotated at the bottom of the HTML as \`<!-- scroll: vertical X/Ypx -->\`.
+## BC Page Types
+- **List page**: Grid/table of records. Action bar has New, Delete, etc. Grid uses \`table.ms-nav-grid-data-table\` or \`[role="grid"]\`.
+- **Card page**: Single record with FastTab sections. Fields are \`<div controlname="X"><input/></div>\`.
+- **Document page**: Card + embedded grid (header fields + line items).
+- **Worksheet page**: Full-page editable grid (journal-style). Has \`[role="grid"]\` with editable inputs in cells.
+- **Dialog**: Modal overlay with \`[role="dialog"]\` or \`[class*="ms-nav-popup"]\`.
 
-## Key DOM Patterns
-- FastTab header: element with \`aria-expanded="true|false"\` and \`aria-label="TabName"\`
-- Field: \`<div controlname="FieldName"><input value="..."/></div>\`
-- Action button: \`<button role="menuitem" aria-label="ActionName">\`
-- Grid row: \`<tr>\` or \`[role="row"]\` inside a table or \`[role="grid"]\`
+## CRITICAL: Edit Mode Duplication
+When BC enters edit mode, it renders a SECOND set of elements (grids, fields, buttons) on top of view-mode content WITHOUT wrapping them in \`[role="dialog"]\`. Both sets stay in the DOM. **Always target the LAST visible match** in document order — that's the edit-mode (interactive) version.
+
+## CRITICAL: Overlay/Dialog Handling
+BC opens records as modal overlays stacked on top of list pages. Multiple overlays can stack.
+- \`[role="dialog"]\`, \`[class*="ms-nav-popup"]\`, \`[class*="modal-dialog"]\` mark overlays
+- Ignore \`[class*="TeachingBubble"]\` — those are tooltips
+- **Always interact with the TOPMOST (last in DOM order) visible overlay**
+- The HTML will be annotated with \`<!-- ACTIVE LAYER -->\` and \`<!-- BACKGROUND LAYER -->\` comments
+
+## Field Finding (priority order)
+1. \`td[controlname="FieldName"] input\` — grid cells (most reliable for worksheets/documents)
+2. \`[controlname="FieldName"] input\` — card fields
+3. \`[aria-label="FieldName"]\` — exact aria-label on the element
+4. \`input[aria-label*="FieldName"]\` — partial aria-label on inputs
+5. \`[aria-label*="FieldName"]\` — partial match (prefer shortest label = most specific)
+6. \`[title*="FieldName"]\` — title attribute (skip elements titled "Open Menu")
+7. Caption text → adjacent sibling input — label element with matching text
+
+## Action Button Finding (priority order)
+1. Dialog scope first: \`[role="dialog"]:last-of-type button[role="menuitem"][aria-label="X"]\`
+2. Exact role: \`button[role="menuitem"][aria-label="X"]\`, \`[role="button"][aria-label="X"]\`, \`a[role="link"][aria-label="X"]\`
+3. Partial name: same roles without exact match
+4. CSS text: \`button:has-text("X")\`, \`[role="menuitem"]:has-text("X")\`
+5. getByText: any element containing the text
+For OK/Cancel/Close/Yes/No: if no dialog is visible, the dialog already closed — skip.
+
+## FastTab Patterns
+- Headers: elements with \`aria-expanded="true|false"\` inside card form containers
+- Container classes: \`collapsibleTab\`, \`collapsibleTab-container\`
+- **CRITICAL**: Collapsed FastTabs (aria-expanded="false") do NOT render child fields in the DOM. You MUST expand the tab first, then re-read HTML to find the fields.
+- "Show more" links: \`a\` or \`span\` with text "Show more" / "Vis mere" / "Mehr anzeigen", SCOPED to the FastTab container
+
+## Grid/Row Patterns
+- Data tables: \`table.ms-nav-grid-data-table\`, \`table[class*="ms-nav-grid"][class*="data"]\`
+- ARIA grids: \`[role="grid"]\` with \`[role="row"]\` children
+- Iterate tables in REVERSE (edit-mode grid is last in DOM order)
+- Data rows: exclude \`th\`, \`[role="columnheader"]\`, and empty rows
+- Click the row's \`<a>\` link if available, otherwise the first \`<td>\`
+
+## Input Patterns
+- Text: click to focus → fill/type → Tab to confirm
+- Boolean: \`input[type="checkbox"]\` or \`[role="checkbox"]\` — check current state, click to toggle
+- Combobox: \`[role="combobox"]\` — type value, Tab to auto-match
+- Concealed: \`input[type="password"]\` (e.g., IBAN) — same as text
+- Assist-edit: click field to focus → "..." button appears → click it (or F6 shortcut)
+
+## Scroll State
+Annotated at bottom: \`<!-- scroll: vertical X/Ypx, horizontal X/Ypx -->\`
 
 Always respond with ONLY a JSON object.`;
 
@@ -216,6 +265,89 @@ export function parseConfirmResponse(text: string): DomConfirmResult {
   };
 }
 
+// --- Advise (co-pilot mode) ---
+
+export interface DomAdvice {
+  pageType: string;
+  pageTitle: string;
+  elementVisible: boolean;
+  preparation: Array<{
+    action: 'expandSection' | 'scrollTo' | 'clickShowMore';
+    selector: string;
+    reason: string;
+  }>;
+  suggestedSelector: string;
+  confidence: string;
+  reasoning: string;
+}
+
+export function buildAdvisePrompt(
+  html: string,
+  source: StepSource,
+  patterns: KnowledgePattern[],
+): string {
+  const patternContext = patternsToPromptContext(patterns);
+  const target =
+    source.type === 'input'
+      ? `input field "${source.field}" (to type "${source.value}")`
+      : source.row != null
+        ? `row ${typeof source.row === 'number' ? `#${source.row}` : `"${source.row}"`} in the grid`
+        : source.assistEdit
+          ? `assist-edit "..." button for "${source.caption}"`
+          : `action/button "${source.caption}"`;
+
+  return `You are advising a Playwright automation system about how to reach ${target} on this BC page.
+
+The system has its own hardcoded strategies for finding elements, but it needs your help to:
+1. Understand what page/state we're on
+2. Identify if preparation is needed BEFORE the system tries its strategies (expand FastTab, scroll, click Show more)
+3. Suggest the best CSS selector if you can see the element
+
+${patternContext}
+
+## Current Page HTML
+\`\`\`html
+${html}
+\`\`\`
+
+Return JSON:
+{
+  "pageType": "list|card|document|worksheet|dialog",
+  "pageTitle": "<page title>",
+  "elementVisible": <true if the target element is present in the current HTML>,
+  "preparation": [
+    { "action": "expandSection"|"scrollTo"|"clickShowMore", "selector": "<CSS selector to click/scroll>", "reason": "<why>" }
+  ],
+  "suggestedSelector": "<CSS selector for the target element, or best guess if not yet visible>",
+  "confidence": "high|medium|low",
+  "reasoning": "<explain: what page are we on, is the element visible, what needs to happen first>"
+}
+
+IMPORTANT:
+- If the element is in a collapsed FastTab (aria-expanded="false"), the HTML WON'T contain its fields — include an expandSection prep step
+- If the element is already visible in the HTML, set preparation to [] and provide the direct selector
+- For actions: check if a dialog is open (search inside dialog first)
+- For fields: check controlname attribute first (most reliable)
+- Always use .last() or :last-of-type hints when edit-mode duplication is possible`;
+}
+
+export function parseAdviseResponse(text: string): DomAdvice {
+  const json = JSON.parse(extractJson(text));
+  return {
+    pageType: json.pageType ?? 'unknown',
+    pageTitle: json.pageTitle ?? '',
+    elementVisible: json.elementVisible === true,
+    preparation: (json.preparation ?? []).map((p: Record<string, unknown>) => ({
+      action: p.action as string,
+      selector: (p.selector as string) ?? '',
+      reason: (p.reason as string) ?? '',
+    })),
+    suggestedSelector: json.suggestedSelector ?? '',
+    confidence: json.confidence ?? 'low',
+    reasoning: json.reasoning ?? '',
+  };
+}
+
 // --- Client ---
 
 /** Extracts JSON from a response that may have markdown code fences. */
@@ -278,5 +410,17 @@ export class DomInterpreter {
     const text = await this.call(prompt);
     debug(`DOM confirm response: ${text.slice(0, 200)}`);
     return parseConfirmResponse(text);
+  }
+
+  /**
+   * Co-pilot mode: advises the player on what preparation is needed
+   * before running its hardcoded strategies, and suggests a selector.
+   */
+  async advise(html: string, source: StepSource, patterns: KnowledgePattern[]): Promise<DomAdvice> {
+    const prompt = buildAdvisePrompt(html, source, patterns);
+    debug(`DOM advise: ${source.caption ?? source.field ?? source.row ?? 'unknown'}`);
+    const text = await this.call(prompt);
+    debug(`DOM advise response: ${text.slice(0, 200)}`);
+    return parseAdviseResponse(text);
   }
 }
