@@ -207,7 +207,33 @@ async function investigateStep(
   );
   debug(`  [LOCATE] reasoning: ${locateResult.reasoning}`);
 
-  // If not found, emit a failed step immediately
+  // If not found but prep steps exist (e.g., "expand the collapsed FastTab first"),
+  // execute the prep steps, re-extract HTML, and re-locate before giving up.
+  if (!locateResult.found && locateResult.stepsToReach.length > 0) {
+    info(`  [LOCATE] Not found yet, but ${locateResult.stepsToReach.length} prep step(s) to try`);
+    debug(`  [LOCATE] reasoning: ${locateResult.reasoning}`);
+
+    for (const prep of locateResult.stepsToReach) {
+      debug(`    ${prep.action}: ${prep.selector} — ${prep.reason ?? ''}`);
+      try {
+        await frame.locator(prep.selector).click();
+        await waitForBCIdle(page);
+      } catch (err) {
+        info(
+          `    Prep step failed: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`,
+        );
+      }
+    }
+
+    // Re-extract and re-locate
+    const retryExtract = await extractPageHtml(frame);
+    locateResult = await interpreter.locate(retryExtract.html, source, patterns);
+    info(
+      `  [LOCATE] Re-locate: found=${locateResult.found} selector="${locateResult.interactSelector}" confidence=${locateResult.confidence}`,
+    );
+  }
+
+  // If still not found after prep, emit a failed step
   if (!locateResult.found) {
     info(`  [LOCATE] WARNING: element not found — "${locateResult.reasoning}"`);
     return {
