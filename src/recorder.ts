@@ -3,11 +3,13 @@ import { existsSync } from 'fs';
 import { DemoConfig } from './config.js';
 import { playDemo, type PlayResult, type PlayOptions, type StepTimingMetadata } from './player.js';
 import { info, debug } from './log.js';
+import type { StepDiscovery } from './types.js';
 
 export interface RecordResult {
   success: boolean;
   videoPath?: string;
   timing?: StepTimingMetadata;
+  discoveries?: StepDiscovery[];
   error?: string;
 }
 
@@ -31,9 +33,14 @@ export async function recordDemo(
     const result: PlayResult = await playDemo(absoluteSpecPath, config, options);
 
     if (result.success) {
-      return { success: true, videoPath: result.videoPath, timing: result.timing };
+      return {
+        success: true,
+        videoPath: result.videoPath,
+        timing: result.timing,
+        discoveries: result.discoveries,
+      };
     } else {
-      return { success: false, error: result.error };
+      return { success: false, error: result.error, discoveries: result.discoveries };
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

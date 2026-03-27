@@ -5,6 +5,7 @@ import { resolve, parse as parsePath } from 'path';
 import { DemoConfig } from './config.js';
 import { injectCursor, cursorClickLocator, cursorClickAt, animateCursorTo } from './cursor.js';
 import { info, debug, cleanDescription } from './log.js';
+import type { PageType, AccessPathStep, StepDiscovery } from './types.js';
 
 export interface Recording {
   description: string;
@@ -13,6 +14,7 @@ export interface Recording {
     profile?: string;
     page?: string;
     pageId?: number;
+    mode?: 'edit';
   };
   timeout?: number;
   steps: RecordingStep[];
@@ -27,6 +29,8 @@ export interface RecordingStep {
   value?: string;
   description?: string;
   assistEdit?: boolean;
+  /** Nested steps for scope containers */
+  steps?: RecordingStep[];
 }
 
 export interface StepTimingEntry {
@@ -44,26 +48,521 @@ export interface PlayResult {
   success: boolean;
   videoPath?: string;
   timing?: StepTimingMetadata;
+  /** Per-step discovery metadata (populated in investigate mode) */
+  discoveries?: StepDiscovery[];
   error?: string;
 }
 
 export interface PlayOptions {
   stepDelays?: Map<number, number>;
+  /** 'record' (default) = normal recording with video+cursor; 'investigate' = headless dry run */
+  mode?: 'record' | 'investigate';
+  /** Discovery hints from a prior investigation run — used as fast-path in record mode */
+  discoveries?: StepDiscovery[];
 }
 
 const NAV_DELAY_MS = 2000;
 const END_DELAY_MS = 2000;
 const NAV_TIMEOUT_MS = 120_000;
 
+// ═══════════════════════════════════════════════════════════
+// Unified Finder Functions
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Finds a BC field by name in the frame DOM. Returns position, selector
+ * description, and strategy name. This is the single source of truth for
+ * field-finding logic — all other field functions use this.
+ */
+export async function findFieldInFrame(
+  frame: Frame,
+  fieldName: string,
+): Promise<{ x: number; y: number; selector: string; strategy: string } | null> {
+  return frame.evaluate((name: string) => {
+    type FieldResult = { x: number; y: number; selector: string; strategy: string };
+
+    function visible(el: Element) {
+      const r = (el as HTMLElement).getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    }
+    function center(el: Element) {
+      const r = (el as HTMLElement).getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) return null;
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    }
+    // When BC enters edit mode it renders a second set of grids/fields on top
+    // of the view-mode content WITHOUT wrapping them in [role="dialog"]. Both
+    // sets stay in the DOM; the edit-mode elements come LAST in document order.
+    // → For each strategy, keep the LAST visible match.
+
+    // Strategy 1: BC grid cell — td[controlname] contains the input
+    let last: FieldResult | null = null;
+    for (const td of document.querySelectorAll(`td[controlname="${name}"]`)) {
+      const input = td.querySelector(
+        'input, textarea, select, [role="textbox"], [role="combobox"]',
+      );
+      if (input) {
+        const c = center(input);
+        if (c) last = { ...c, selector: `td[controlname="${name}"] input`, strategy: 'gridCell' };
+      } else {
+        const c = center(td);
+        if (c) last = { ...c, selector: `td[controlname="${name}"]`, strategy: 'gridCell' };
+      }
+    }
+    if (last) return last;
+
+    // Strategy 2: Exact aria-label match
+    for (const el of document.querySelectorAll(`[aria-label="${name}"]`)) {
+      const c = center(el);
+      if (c) last = { ...c, selector: `[aria-label="${name}"]`, strategy: 'exactAriaLabel' };
+    }
+    if (last) return last;
+
+    // Strategy 3: Input elements with substring aria-label match
+    for (const el of document.querySelectorAll(
+      'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]',
+    )) {
+      if (el.getAttribute('aria-label')?.includes(name)) {
+        const c = center(el);
+        if (c) last = { ...c, selector: `inputAriaLabel:${name}`, strategy: 'inputAriaLabel' };
+      }
+    }
+    if (last) return last;
+
+    // Strategy 4: Substring aria-label — pick shortest label (most specific)
+    // Among shortest-label matches, prefer the last one
+    const candidates: Array<{ el: Element; len: number }> = [];
+    for (const el of document.querySelectorAll(`[aria-label*="${name}"]`)) {
+      if (el.getAttribute('aria-label')?.startsWith('Open menu for')) continue;
+      if (visible(el)) candidates.push({ el, len: el.getAttribute('aria-label')?.length ?? 0 });
+    }
+    if (candidates.length > 0) {
+      const minLen = Math.min(...candidates.map((c) => c.len));
+      const shortest = candidates.filter((c) => c.len === minLen);
+      const c = center(shortest[shortest.length - 1].el);
+      if (c) return { ...c, selector: `[aria-label*="${name}"]`, strategy: 'partialAriaLabel' };
+    }
+
+    // Strategy 5: Title attribute match (skip "Open Menu" links)
+    for (const el of document.querySelectorAll(`[title*="${name}"]`)) {
+      if (el.getAttribute('title') === 'Open Menu') continue;
+      const c = center(el);
+      if (c) last = { ...c, selector: `[title*="${name}"]`, strategy: 'titleAttr' };
+    }
+    if (last) return last;
+
+    // Strategy 6: Caption label → sibling value element
+    for (const cap of document.querySelectorAll('label, [class*="caption"], [class*="Caption"]')) {
+      if (cap.textContent?.trim() === name || cap.textContent?.includes(name)) {
+        const parent = cap.parentElement;
+        if (parent) {
+          const ctrl = parent.querySelector(
+            'input, textarea, select, [role="textbox"], [role="combobox"], [contenteditable="true"]',
+          );
+          if (ctrl) {
+            const c = center(ctrl);
+            if (c) last = { ...c, selector: `caption:${name}`, strategy: 'caption' };
+          }
+          const sibling = cap.nextElementSibling;
+          if (sibling) {
+            const c = center(sibling);
+            if (c) last = { ...c, selector: `caption:${name}`, strategy: 'caption' };
+          }
+        }
+      }
+    }
+    return last;
+  }, fieldName);
+}
+
+/**
+ * Finds a row in a BC list grid by index or text match. Returns position,
+ * row index, and matched text for discovery metadata.
+ */
+export async function findRowInFrame(
+  frame: Frame,
+  rowTarget: number | string,
+): Promise<{
+  x: number;
+  y: number;
+  matchedRowIndex: number;
+  matchedRowText: string;
+  selector: string;
+} | null> {
+  return frame.evaluate((target: number | string) => {
+    function getScope(): Element {
+      const dialogs = document.querySelectorAll(
+        '[role="dialog"], [class*="ms-nav-popup"], [class*="modal-dialog"]',
+      );
+      for (let i = dialogs.length - 1; i >= 0; i--) {
+        const d = dialogs[i] as HTMLElement;
+        if (
+          d.offsetWidth > 0 &&
+          d.offsetHeight > 0 &&
+          !d.className?.includes('TeachingBubble') &&
+          d.querySelector('table, [role="grid"]')
+        )
+          return d;
+      }
+      return document.body;
+    }
+    const scope = getScope();
+
+    // When BC enters edit mode, duplicate grids appear in the DOM.
+    // The edit-mode grid comes LAST in document order. Iterate in
+    // reverse so we pick the topmost (edit-mode) grid.
+    function getDataRows(): Element[] {
+      const tables = Array.from(
+        scope.querySelectorAll(
+          'table.ms-nav-grid-data-table, table[class*="ms-nav-grid"][class*="data"]',
+        ),
+      );
+      for (let i = tables.length - 1; i >= 0; i--) {
+        const rows = Array.from(tables[i].querySelectorAll('tbody > tr, tr[role="row"]'));
+        const data = rows.filter(
+          (r) =>
+            !r.querySelector('th') &&
+            !r.querySelector('[role="columnheader"]') &&
+            r.querySelector('td') &&
+            Array.from(r.querySelectorAll('td')).some((c) =>
+              (c as HTMLElement).textContent?.trim(),
+            ),
+        );
+        if (data.length > 0) return data;
+      }
+      const grids = Array.from(scope.querySelectorAll('[role="grid"]'));
+      for (let i = grids.length - 1; i >= 0; i--) {
+        const rows = Array.from(grids[i].querySelectorAll('[role="row"]'));
+        const data = rows.filter(
+          (r) =>
+            !r.querySelector('[role="columnheader"]') &&
+            Array.from(r.querySelectorAll('[role="gridcell"]')).some((c) =>
+              (c as HTMLElement).textContent?.trim(),
+            ),
+        );
+        if (data.length > 0) return data;
+      }
+      return [];
+    }
+
+    const rows = getDataRows();
+    let matchedIndex = -1;
+    const row =
+      typeof target === 'number'
+        ? ((matchedIndex = target - 1), rows[target - 1] ?? null)
+        : (rows.find((r, i) => {
+            const search = target.toLowerCase();
+            const found = Array.from(r.querySelectorAll('td, [role="gridcell"]')).some((c) =>
+              (c.textContent?.trim().toLowerCase() ?? '').includes(search),
+            );
+            if (found) matchedIndex = i;
+            return found;
+          }) ?? null);
+    if (!row) return null;
+
+    // Collect row text
+    const cells = Array.from(row.querySelectorAll('td, [role="gridcell"]'));
+    const rowText = cells
+      .map((c) => (c as HTMLElement).textContent?.trim())
+      .filter(Boolean)
+      .join(' - ');
+
+    const link = row.querySelector('a');
+    const el = link ?? row.querySelector('td') ?? row;
+    const rect = (el as HTMLElement).getBoundingClientRect();
+    return {
+      x: rect.x + Math.min(rect.width * 0.3, 40),
+      y: rect.y + rect.height / 2,
+      matchedRowIndex: matchedIndex + 1, // 1-based
+      matchedRowText: rowText.slice(0, 200),
+      selector: `dataRow:${matchedIndex + 1}`,
+    };
+  }, rowTarget);
+}
+
+/**
+ * Determines which strategy would find a BC action button, without clicking it.
+ * Returns the strategy name and a selector description. Used by investigate mode
+ * to capture which approach works for each action.
+ */
+export async function findActionStrategy(
+  frame: Frame,
+  page: Page,
+  caption: string,
+): Promise<{ strategy: string; selector: string } | null> {
+  // Check dialog first
+  const dialogLocator = frame.locator(
+    '[role="dialog"]:visible:not([class*="TeachingBubble"]), [class*="ms-nav-popup"]:visible',
+  );
+  const hasDialog = (await dialogLocator.count()) > 0;
+
+  if (hasDialog) {
+    const dialog = dialogLocator.last();
+    for (const role of ['button', 'menuitem', 'link'] as const) {
+      const loc = dialog.getByRole(role, { name: caption, exact: true });
+      if ((await loc.count()) > 0) {
+        return {
+          strategy: `dialog:exactAriaName:${role}`,
+          selector: `getByRole:${role}:${caption}`,
+        };
+      }
+    }
+    const dialogText = dialog.getByText(caption, { exact: true });
+    if ((await dialogText.count()) > 0) {
+      return { strategy: 'dialog:getByText', selector: `getByText:${caption}` };
+    }
+  }
+
+  const DIALOG_BUTTONS = ['ok', 'cancel', 'close', 'yes', 'no'];
+  if (!hasDialog && DIALOG_BUTTONS.includes(caption.toLowerCase())) {
+    return { strategy: 'dialogAlreadyClosed', selector: 'none' };
+  }
+
+  // Strategy 1: Exact role match
+  for (const role of ['button', 'menuitem', 'link'] as const) {
+    const locator = frame.getByRole(role, { name: caption, exact: true });
+    if ((await locator.count()) > 0) {
+      return { strategy: `exactAriaName:${role}`, selector: `getByRole:${role}:${caption}` };
+    }
+  }
+
+  // Strategy 2: Partial role match
+  for (const role of ['button', 'menuitem', 'link'] as const) {
+    const locator = frame.getByRole(role, { name: caption });
+    if ((await locator.count()) > 0) {
+      return { strategy: `partialAriaName:${role}`, selector: `getByRole:${role}:*${caption}*` };
+    }
+  }
+
+  // Strategy 3: CSS text content match
+  const textLocator = frame.locator(
+    `button:has-text("${caption}"), [role="button"]:has-text("${caption}"), [role="menuitem"]:has-text("${caption}"), a:has-text("${caption}"), span:has-text("${caption}")`,
+  );
+  if ((await textLocator.count()) > 0) {
+    return { strategy: 'cssText', selector: `has-text:${caption}` };
+  }
+
+  // Strategy 4: getByText
+  const byText = frame.getByText(caption, { exact: true });
+  if ((await byText.count()) > 0) {
+    return { strategy: 'getByText', selector: `getByText:${caption}` };
+  }
+
+  // Strategy 5: Top bar (main page, not frame)
+  const pageLocator = page.locator(
+    `button:has-text("${caption}"), [role="button"]:has-text("${caption}")`,
+  );
+  if ((await pageLocator.count()) > 0) {
+    return { strategy: 'topBar', selector: `topBar:has-text:${caption}` };
+  }
+
+  return null;
+}
+
+/**
+ * Detects the BC page type by checking DOM markers in the frame.
+ */
+export async function detectPageType(frame: Frame): Promise<PageType> {
+  return frame.evaluate(() => {
+    // Check for modal dialog first (highest priority)
+    const dialogs = document.querySelectorAll('[role="dialog"]:not([class*="TeachingBubble"])');
+    for (let i = dialogs.length - 1; i >= 0; i--) {
+      const d = dialogs[i] as HTMLElement;
+      if (d.offsetWidth > 0 && d.offsetHeight > 0) return 'Dialog' as const;
+    }
+
+    const hasCardForm = !!document.querySelector('div.ms-nav-cardform, [class*="ms-nav-card"]');
+    const dataTable = document.querySelector(
+      'table.ms-nav-grid-data-table, table[class*="ms-nav-grid"][class*="data"]',
+    );
+    const hasGrid = !!dataTable || !!document.querySelector('[role="grid"]');
+
+    // Document = Card with embedded grid (header + lines)
+    if (hasCardForm && hasGrid) return 'Document' as const;
+
+    // Card = Single-record form, no data grid
+    if (hasCardForm) return 'Card' as const;
+
+    // Worksheet = Full-page editable grid (journal-style)
+    if (hasGrid) {
+      // Check if rows are editable (worksheet/journal vs read-only list)
+      const editableCells = document.querySelectorAll(
+        '[role="grid"] input, [role="grid"] [contenteditable="true"], [role="grid"] [role="textbox"]',
+      );
+      if (editableCells.length > 0) return 'Worksheet' as const;
+      return 'List' as const;
+    }
+
+    return 'Card' as const; // fallback
+  }) as Promise<PageType>;
+}
+
+/**
+ * Prepares access to a field by expanding collapsed FastTabs and clicking
+ * "Show more" if needed. Returns the access path steps that were taken.
+ * This is the shared implementation — both record and investigate mode use it.
+ */
+export async function prepareFieldAccess(
+  frame: Frame,
+  page: Page,
+  fieldName: string,
+): Promise<AccessPathStep[]> {
+  const accessPath: AccessPathStep[] = [];
+
+  // --- FastTab expansion ---
+  const headerToClick = await frame.evaluate((name: string) => {
+    function findFieldElement(): Element | null {
+      for (const el of document.querySelectorAll(`[aria-label*="${name}"], [title*="${name}"]`)) {
+        return el;
+      }
+      for (const el of document.querySelectorAll(
+        'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]',
+      )) {
+        if (el.getAttribute('aria-label')?.includes(name)) return el;
+      }
+      for (const cap of document.querySelectorAll(
+        'label, [class*="caption"], [class*="Caption"]',
+      )) {
+        if (cap.textContent?.trim() === name || cap.textContent?.includes(name)) return cap;
+      }
+      return null;
+    }
+
+    const field = findFieldElement();
+    if (!field) return null;
+
+    const rect = (field as HTMLElement).getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) return null;
+
+    let el: Element | null = field;
+    while (el) {
+      const header = el.querySelector('[aria-expanded="false"]');
+      if (header) {
+        const headerRect = (header as HTMLElement).getBoundingClientRect();
+        if (headerRect.width > 0 && headerRect.height > 0) {
+          // Try to get the FastTab name from the header text
+          const tabName = (header as HTMLElement).textContent?.trim().split('\n')[0]?.trim() ?? '';
+          return {
+            x: headerRect.x + headerRect.width / 2,
+            y: headerRect.y + headerRect.height / 2,
+            tabName,
+          };
+        }
+      }
+      if (
+        el.classList?.contains('collapsibleTab') ||
+        el.classList?.contains('collapsibleTab-container')
+      ) {
+        const hdr =
+          el.querySelector('[aria-expanded="false"]') ??
+          el.previousElementSibling?.querySelector('[aria-expanded="false"]') ??
+          el.parentElement?.querySelector('[aria-expanded="false"]');
+        if (hdr) {
+          const headerRect = (hdr as HTMLElement).getBoundingClientRect();
+          if (headerRect.width > 0 && headerRect.height > 0) {
+            const tabName = (hdr as HTMLElement).textContent?.trim().split('\n')[0]?.trim() ?? '';
+            return {
+              x: headerRect.x + headerRect.width / 2,
+              y: headerRect.y + headerRect.height / 2,
+              tabName,
+            };
+          }
+        }
+      }
+      el = el.parentElement;
+    }
+    return null;
+  }, fieldName);
+
+  if (headerToClick) {
+    debug(`Expanding collapsed FastTab for field "${fieldName}"`);
+    await frame.evaluate(({ x, y }) => {
+      const el = document.elementFromPoint(x, y) as HTMLElement | null;
+      el?.click();
+    }, headerToClick);
+    await page.waitForTimeout(500);
+    await awaitBCFrame(page, 10_000).catch(() => {});
+    accessPath.push({ expandFastTab: headerToClick.tabName || fieldName });
+  }
+
+  // --- "Show more" click ---
+  const showMoreToClick = await frame.evaluate((name: string) => {
+    function findFieldElement(): Element | null {
+      for (const el of document.querySelectorAll(`[aria-label*="${name}"], [title*="${name}"]`)) {
+        return el;
+      }
+      for (const el of document.querySelectorAll(
+        'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]',
+      )) {
+        if (el.getAttribute('aria-label')?.includes(name)) return el;
+      }
+      for (const cap of document.querySelectorAll(
+        'label, [class*="caption"], [class*="Caption"]',
+      )) {
+        if (cap.textContent?.trim() === name || cap.textContent?.includes(name)) return cap;
+      }
+      return null;
+    }
+
+    const field = findFieldElement();
+    if (!field) return null;
+
+    const rect = (field as HTMLElement).getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) return null;
+
+    let container: Element | null = field;
+    while (container) {
+      if (
+        container.classList?.contains('collapsibleTab') ||
+        container.classList?.contains('collapsibleTab-container') ||
+        container.getAttribute('role') === 'tabpanel' ||
+        container.getAttribute('role') === 'group'
+      ) {
+        break;
+      }
+      container = container.parentElement;
+    }
+
+    const scope = container ?? document;
+    for (const el of scope.querySelectorAll('a, button, [role="button"], [role="link"], span')) {
+      const text = (el as HTMLElement).innerText?.trim().toLowerCase();
+      if (text === 'show more' || text === 'vis mere' || text === 'mehr anzeigen') {
+        const r = (el as HTMLElement).getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) {
+          return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+        }
+      }
+    }
+    return null;
+  }, fieldName);
+
+  if (showMoreToClick) {
+    debug(`Clicking "Show more" for field "${fieldName}"`);
+    await frame.evaluate(({ x, y }) => {
+      const el = document.elementFromPoint(x, y) as HTMLElement | null;
+      el?.click();
+    }, showMoreToClick);
+    await page.waitForTimeout(500);
+    await awaitBCFrame(page, 10_000).catch(() => {});
+    accessPath.push({ clickShowMore: true });
+  }
+
+  return accessPath;
+}
+
 export async function playDemo(
   specPath: string,
   config: DemoConfig,
   options?: PlayOptions,
 ): Promise<PlayResult> {
+  const mode = options?.mode ?? 'record';
+  const isInvestigate = mode === 'investigate';
+  const discoveries: StepDiscovery[] = [];
+
   const absoluteSpecPath = resolve(specPath);
   const specContent = readFileSync(absoluteSpecPath, 'utf-8');
   const recording: Recording = parseYaml(specContent);
-  const specName = parsePath(absoluteSpecPath).name;
+  const specName = parsePath(absoluteSpecPath).name.replace(/\.enriched$/, '');
 
   // Build BC URL with profile and optional page ID
   const bcUrl = new URL(config.bcStartAddress);
@@ -77,7 +576,8 @@ export async function playDemo(
   const outputDir = resolve(config.outputDir);
   mkdirSync(outputDir, { recursive: true });
 
-  const browser = await chromium.launch({ headless: !config.headed });
+  // Investigation runs headless regardless of config
+  const browser = await chromium.launch({ headless: isInvestigate ? true : !config.headed });
 
   // --- Phase A: Authenticate in a non-recording context ---
   debug(`Navigating to: ${bcUrl.toString()}`);
@@ -110,11 +610,14 @@ export async function playDemo(
   const authenticatedUrl = authPage.url();
   await authContext.close();
 
-  // --- Phase B: Record in a fresh context with video enabled ---
-  const context = await browser.newContext({
+  // --- Phase B: Create context (with or without video) ---
+  const contextOptions: Parameters<typeof browser.newContext>[0] = {
     viewport: { width: 1920, height: 1080 },
-    recordVideo: { dir: outputDir, size: { width: 1920, height: 1080 } },
-  });
+  };
+  if (!isInvestigate) {
+    contextOptions.recordVideo = { dir: outputDir, size: { width: 1920, height: 1080 } };
+  }
+  const context = await browser.newContext(contextOptions);
   await context.addCookies(cookies);
   const page = await context.newPage();
   let timing: StepTimingMetadata | undefined;
@@ -124,15 +627,45 @@ export async function playDemo(
     await page.goto(authenticatedUrl);
     const videoStartMs = Date.now();
 
-    // Wait for BC to be ready in the recording context (skips "Getting Ready" screen)
+    // Wait for BC to be ready
     await page.waitForTimeout(200);
     const frame = await awaitBCFrame(page);
+
+    // Click Edit/Edit List before recording content begins (trimmed with loading screen)
+    if (recording.start?.mode === 'edit') {
+      debug('start.mode=edit — switching page to edit mode');
+      let clicked = false;
+      for (const label of ['Edit', 'Edit List']) {
+        const btn = frame.getByRole('menuitem', { name: label, exact: true });
+        if ((await btn.count()) > 0) {
+          await btn.first().click();
+          info(`Clicked "${label}" to enter edit mode`);
+          // Wait for BC to settle after mode switch (page may become modal)
+          await awaitBCFrame(page, 10_000).catch(() => {});
+          await page.waitForTimeout(300);
+          clicked = true;
+          break;
+        }
+      }
+      if (!clicked) {
+        info('WARNING: Neither "Edit" nor "Edit List" found — page may already be in edit mode');
+      }
+    }
+
     const bcReadyMs = Date.now();
-    await injectCursor(page);
-    // Brief pause so the first frame of the trimmed video shows the loaded page
-    await page.waitForTimeout(500);
+
+    // Only inject cursor and track timing in record mode
+    if (!isInvestigate) {
+      await injectCursor(page);
+      // Brief pause so the first frame of the trimmed video shows the loaded page
+      await page.waitForTimeout(500);
+    }
     const trimStartMs = bcReadyMs - videoStartMs;
-    info(`BC loaded (trimming ${(trimStartMs / 1000).toFixed(1)}s of loading screen)`);
+    if (!isInvestigate) {
+      info(`BC loaded (trimming ${(trimStartMs / 1000).toFixed(1)}s of loading screen)`);
+    } else {
+      info('BC loaded — starting investigation');
+    }
 
     const timingSteps: StepTimingEntry[] = [];
 
@@ -184,154 +717,450 @@ export async function playDemo(
     debug('DOM structure:');
     gridInfo.forEach((line) => debug(`  ${line}`));
 
-    // Execute each step using Playwright clicks with delays
+    // Execute each step
     for (let i = 0; i < recording.steps.length; i++) {
       const step = recording.steps[i];
       const stepStartTime = Date.now();
       const stepStartMs = stepStartTime - videoStartMs;
       const stepDesc = cleanDescription(step.description ?? step.caption ?? '');
-      info(`[${i + 1}/${recording.steps.length}] ${stepDesc}`);
+      const prefix = isInvestigate ? '[investigate]' : `[${i + 1}/${recording.steps.length}]`;
+      info(`${prefix} Step ${i + 1}/${recording.steps.length}: ${stepDesc}`);
 
-      const currentFrame = await awaitBCFrame(page, 10_000).catch(() => frame);
+      // Discovery metadata for this step (populated during execution)
+      const stepDiscovery: StepDiscovery = {};
+      const hint = options?.discoveries?.[i];
 
-      if (step.type === 'action' && step.assistEdit && step.caption) {
-        // Click the assist-edit "..." button on a field
-        await clickAssistEdit(currentFrame, page, step.caption);
-      } else if (step.type === 'action' && step.row) {
-        // Click on a specific row in the list grid
-        await clickBCRow(currentFrame, step.row, page);
-      } else if (step.type === 'action' && step.caption) {
-        // Click a button/action by caption text
-        let clicked = await clickBCAction(currentFrame, page, step.caption);
+      let currentFrame: Frame;
+      try {
+        currentFrame = await awaitBCFrame(page, 10_000);
+      } catch {
+        currentFrame = frame;
+      }
 
-        // If not found and the previous step was a menu open, re-open it and retry
-        if (!clicked && i > 0) {
-          const prevStep = recording.steps[i - 1];
-          if (prevStep.type === 'action' && prevStep.caption) {
-            debug(`Re-opening menu "${prevStep.caption}" and retrying...`);
-            await clickBCAction(currentFrame, page, prevStep.caption);
-            await page.waitForTimeout(500); // Wait for dropdown to render
+      // Detect page type for discovery
+      try {
+        stepDiscovery.pageType = await detectPageType(currentFrame);
+      } catch {
+        /* non-critical */
+      }
 
-            // Dump all text in the frame to find the element
-            const allText = await currentFrame.evaluate(() => {
-              const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
-              const results: string[] = [];
-              let node: Node | null;
-              while ((node = walker.nextNode())) {
-                const el = node as HTMLElement;
-                const own =
-                  el.childNodes.length === 1 && el.childNodes[0].nodeType === Node.TEXT_NODE
-                    ? (el.childNodes[0].textContent?.trim() ?? '')
-                    : '';
-                if (
-                  own &&
-                  own.length > 0 &&
-                  own.length < 60 &&
-                  own.toLowerCase().includes('more')
-                ) {
-                  results.push(
-                    `<${el.tagName.toLowerCase()} class="${el.className?.toString().slice(0, 40)}" role="${el.getAttribute('role')}">${own}`,
-                  );
-                }
-                if (
-                  own &&
-                  own.length > 0 &&
-                  own.length < 60 &&
-                  own.toLowerCase().includes('column')
-                ) {
-                  results.push(
-                    `<${el.tagName.toLowerCase()} class="${el.className?.toString().slice(0, 40)}" role="${el.getAttribute('role')}">${own}`,
-                  );
-                }
-                if (
-                  own &&
-                  own.length > 0 &&
-                  own.length < 60 &&
-                  own.toLowerCase().includes('show')
-                ) {
-                  results.push(
-                    `<${el.tagName.toLowerCase()} class="${el.className?.toString().slice(0, 40)}" role="${el.getAttribute('role')}">${own}`,
-                  );
+      // In record mode with enrichments: pre-execute access path
+      if (!isInvestigate && hint?.accessPath && hint.accessPath.length > 0) {
+        debug('Applying discovery access path...');
+        for (const pathStep of hint.accessPath) {
+          if ('expandFastTab' in pathStep) {
+            // Click the FastTab header to expand it
+            const tabName = pathStep.expandFastTab;
+            const clicked = await currentFrame.evaluate((name: string) => {
+              for (const header of document.querySelectorAll('[aria-expanded="false"]')) {
+                if ((header as HTMLElement).textContent?.includes(name)) {
+                  (header as HTMLElement).click();
+                  return true;
                 }
               }
-              return [...new Set(results)].slice(0, 30);
+              return false;
+            }, tabName);
+            if (clicked) {
+              await page.waitForTimeout(500);
+              await awaitBCFrame(page, 10_000).catch(() => {});
+            }
+          } else if ('clickShowMore' in pathStep) {
+            await currentFrame.evaluate(() => {
+              for (const el of document.querySelectorAll('a, button, [role="button"], span')) {
+                const text = (el as HTMLElement).innerText?.trim().toLowerCase();
+                if (text === 'show more' || text === 'vis mere' || text === 'mehr anzeigen') {
+                  (el as HTMLElement).click();
+                  return;
+                }
+              }
             });
-            debug(`DOM elements with "show/more/column": ${allText.join('\n    ')}`);
-
-            clicked = await clickBCAction(currentFrame, page, step.caption);
+            await page.waitForTimeout(500);
+            await awaitBCFrame(page, 10_000).catch(() => {});
           }
-        }
-
-        if (!clicked) {
-          info(`  WARNING: Could not find "${step.caption}" — falling back to DN.playRecording`);
-          const singleStep = { ...recording, steps: [step] };
-          await currentFrame.evaluate((data) => {
-            const DN = (window as unknown as Record<string, unknown>)['DN'] as Record<
-              string,
-              (...args: unknown[]) => unknown
-            >;
-            return DN['playRecording'](data);
-          }, singleStep as unknown);
-        }
-      } else if (step.type === 'input' && step.value) {
-        const fieldName = step.target?.find((t) => t.field)?.field;
-        debug(`Filling field "${fieldName}" with "${step.value}"`);
-
-        // If the field is in a collapsed FastTab, expand it first
-        if (fieldName) {
-          await expandFastTabForField(currentFrame, page, fieldName);
-        }
-
-        // Scroll field into view and animate cursor
-        if (fieldName) {
-          await scrollFieldToCenter(currentFrame, page, fieldName);
-          await animateCursorToField(currentFrame, page, fieldName);
-        }
-
-        // Try to fill via td[controlname] first (reliable for BC grid cells),
-        // then fall back to DN.playRecording for card/FastTab fields.
-        let directFilled = false;
-        if (fieldName) {
-          const inputHandle = await currentFrame.$(
-            `td[controlname="${fieldName}"] input, td[controlname="${fieldName}"] [role="textbox"]`,
-          );
-          if (inputHandle) {
-            await inputHandle.click();
-            await page.waitForTimeout(100);
-            await inputHandle.fill(step.value);
-            await page.waitForTimeout(100);
-            await inputHandle.press('Tab');
-            directFilled = true;
-            debug(`Direct fill: entered "${step.value}" in "${fieldName}"`);
-          }
-        }
-
-        if (!directFilled) {
-          debug(`Falling back to DN.playRecording for "${fieldName}"`);
-          const singleStep = { ...recording, steps: [step] };
-          await currentFrame.evaluate((data) => {
-            const DN = (window as unknown as Record<string, unknown>)['DN'] as Record<
-              string,
-              (...args: unknown[]) => unknown
-            >;
-            return DN['playRecording'](data);
-          }, singleStep as unknown);
-        }
-
-        // Re-scroll to show the filled field and animate cursor there
-        if (fieldName) {
-          await page.waitForTimeout(300);
-          const postFrame = await awaitBCFrame(page, 5_000).catch(() => currentFrame);
-          await scrollFieldToCenter(postFrame, page, fieldName);
-          await animateCursorToField(postFrame, page, fieldName);
         }
       }
 
+      try {
+        if (step.type === 'action' && step.assistEdit && step.caption) {
+          // Click the assist-edit "..." button on a field
+          if (isInvestigate) {
+            // Investigation: expand access, find field, click, find assist button
+            const accessPath = await prepareFieldAccess(currentFrame, page, step.caption);
+            stepDiscovery.accessPath = accessPath;
+            const fieldResult = await findFieldInFrame(currentFrame, step.caption);
+            if (fieldResult) {
+              stepDiscovery.selector = fieldResult.selector;
+              stepDiscovery.strategy = fieldResult.strategy;
+              stepDiscovery.fieldFound = true;
+            } else {
+              stepDiscovery.fieldFound = false;
+            }
+          }
+          if (isInvestigate) {
+            // In investigate mode: click field then click assist-edit button
+            // without cursor animation (cursor is not injected)
+            const fieldPos = await findFieldInFrame(currentFrame, step.caption);
+            if (fieldPos) {
+              await currentFrame.evaluate(({ x, y }) => {
+                const el = document.elementFromPoint(x, y) as HTMLElement | null;
+                el?.click();
+              }, fieldPos);
+              await page.waitForTimeout(600);
+              // Find and click the assist-edit "..." button
+              const assistBtn = await currentFrame.evaluate((name: string) => {
+                for (const el of document.querySelectorAll(
+                  `[aria-label*="Choose a value for ${name}"], [aria-label*="choose a value for ${name}"]`,
+                )) {
+                  const rect = (el as HTMLElement).getBoundingClientRect();
+                  if (rect.width > 0 && rect.height > 0) {
+                    (el as HTMLElement).click();
+                    return true;
+                  }
+                }
+                // Fallback: look for lookup button near active element
+                const active = document.activeElement as HTMLElement | null;
+                if (active?.parentElement) {
+                  for (const sib of active.parentElement.querySelectorAll(
+                    '[class*="lookupbutton"], [class*="MoreEllipsis"]',
+                  )) {
+                    const rect = (sib as HTMLElement).getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                      (sib as HTMLElement).click();
+                      return true;
+                    }
+                  }
+                }
+                return false;
+              }, step.caption);
+              if (!assistBtn) {
+                await page.keyboard.press('F6');
+              }
+            }
+          } else {
+            await clickAssistEdit(currentFrame, page, step.caption);
+          }
+        } else if (step.type === 'action' && step.row) {
+          // Click on a specific row in the list grid
+          if (isInvestigate) {
+            const rowResult = await findRowInFrame(currentFrame, step.row);
+            if (rowResult) {
+              stepDiscovery.selector = rowResult.selector;
+              stepDiscovery.matchedRowIndex = rowResult.matchedRowIndex;
+              stepDiscovery.matchedRowText = rowResult.matchedRowText;
+              stepDiscovery.fieldFound = true;
+              info(`  → matchedRowText: "${rowResult.matchedRowText}"`);
+            } else {
+              stepDiscovery.fieldFound = false;
+            }
+          }
+          await clickBCRow(currentFrame, step.row, isInvestigate ? undefined : page);
+        } else if (step.type === 'action' && step.caption) {
+          // Click a button/action by caption text
+          if (isInvestigate) {
+            const actionResult = await findActionStrategy(currentFrame, page, step.caption);
+            if (actionResult) {
+              stepDiscovery.selector = actionResult.selector;
+              stepDiscovery.strategy = actionResult.strategy;
+              stepDiscovery.fieldFound = true;
+              info(`  → strategy: ${actionResult.strategy}`);
+            } else {
+              stepDiscovery.fieldFound = false;
+            }
+          }
+
+          let clicked = await clickBCAction(currentFrame, page, step.caption);
+
+          // If not found and the previous step was a menu open, re-open it and retry
+          if (!clicked && i > 0) {
+            const prevStep = recording.steps[i - 1];
+            if (prevStep.type === 'action' && prevStep.caption) {
+              debug(`Re-opening menu "${prevStep.caption}" and retrying...`);
+              await clickBCAction(currentFrame, page, prevStep.caption);
+              await page.waitForTimeout(500);
+
+              const allText = await currentFrame.evaluate(() => {
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+                const results: string[] = [];
+                let node: Node | null;
+                while ((node = walker.nextNode())) {
+                  const el = node as HTMLElement;
+                  const own =
+                    el.childNodes.length === 1 && el.childNodes[0].nodeType === Node.TEXT_NODE
+                      ? (el.childNodes[0].textContent?.trim() ?? '')
+                      : '';
+                  if (
+                    own &&
+                    own.length > 0 &&
+                    own.length < 60 &&
+                    (own.toLowerCase().includes('more') ||
+                      own.toLowerCase().includes('column') ||
+                      own.toLowerCase().includes('show'))
+                  ) {
+                    results.push(
+                      `<${el.tagName.toLowerCase()} class="${el.className?.toString().slice(0, 40)}" role="${el.getAttribute('role')}">${own}`,
+                    );
+                  }
+                }
+                return [...new Set(results)].slice(0, 30);
+              });
+              debug(`DOM elements with "show/more/column": ${allText.join('\n    ')}`);
+
+              clicked = await clickBCAction(currentFrame, page, step.caption);
+            }
+          }
+
+          if (!clicked) {
+            info(`  WARNING: Could not find "${step.caption}" — falling back to DN.playRecording`);
+            const singleStep = { ...recording, steps: [step] };
+            await currentFrame.evaluate((data) => {
+              const DN = (window as unknown as Record<string, unknown>)['DN'] as Record<
+                string,
+                (...args: unknown[]) => unknown
+              >;
+              return DN['playRecording'](data);
+            }, singleStep as unknown);
+          }
+        } else if (step.type === 'input' && step.value) {
+          const fieldName = step.target?.find((t) => t.field)?.field;
+          debug(`Filling field "${fieldName}" with "${step.value}"`);
+
+          // Prepare field access (expand FastTab, Show More) — always needed
+          if (fieldName) {
+            const accessPath = await prepareFieldAccess(currentFrame, page, fieldName);
+            if (isInvestigate) {
+              stepDiscovery.accessPath = accessPath;
+            }
+          }
+
+          // In record mode: scroll and animate cursor
+          if (!isInvestigate && fieldName) {
+            await scrollFieldToCenter(currentFrame, page, fieldName);
+            await animateCursorToField(currentFrame, page, fieldName);
+          }
+
+          // Find field metadata for investigation
+          if (isInvestigate && fieldName) {
+            const fieldResult = await findFieldInFrame(currentFrame, fieldName);
+            if (fieldResult) {
+              stepDiscovery.selector = fieldResult.selector;
+              stepDiscovery.strategy = fieldResult.strategy;
+              stepDiscovery.fieldFound = true;
+              info(`  → selector: ${fieldResult.selector} (${fieldResult.strategy})`);
+            } else {
+              stepDiscovery.fieldFound = false;
+            }
+          }
+
+          // Try to fill via td[controlname] first, fall back to DN.playRecording.
+          // In investigate mode, this determines inputMethod.
+          let directFilled = false;
+          if (fieldName) {
+            // In record mode with discovery hint, use the known inputMethod
+            if (!isInvestigate && hint?.inputMethod === 'dnPlayRecording') {
+              debug(`Using discovery hint: dnPlayRecording for "${fieldName}"`);
+              directFilled = false; // skip directly to fallback
+            } else {
+              // Boolean fields: look for checkbox first (use last match for edit-mode dupes)
+              const isBoolValue =
+                step.value.toLowerCase() === 'true' || step.value.toLowerCase() === 'false';
+              if (isBoolValue) {
+                const checkHandles = await currentFrame.$$(
+                  `td[controlname="${fieldName}"] input[type="checkbox"], td[controlname="${fieldName}"] [role="checkbox"]`,
+                );
+                const checkHandle =
+                  checkHandles.length > 0 ? checkHandles[checkHandles.length - 1] : null;
+                if (checkHandle) {
+                  const wantChecked = step.value.toLowerCase() === 'true';
+                  const isChecked = await checkHandle
+                    .isChecked()
+                    .catch(() => checkHandle.evaluate((el) => (el as HTMLInputElement).checked));
+                  if (isChecked !== wantChecked) {
+                    await checkHandle.click();
+                    debug(`Toggled checkbox "${fieldName}" → ${wantChecked}`);
+                  } else {
+                    debug(
+                      `Checkbox "${fieldName}" already ${wantChecked ? 'checked' : 'unchecked'}`,
+                    );
+                  }
+                  await page.waitForTimeout(100);
+                  directFilled = true;
+                }
+              }
+              // Text/other fields: fill via td[controlname] input (last match for edit-mode dupes)
+              if (!directFilled) {
+                const inputHandles = await currentFrame.$$(
+                  `td[controlname="${fieldName}"] input, td[controlname="${fieldName}"] [role="textbox"]`,
+                );
+                const inputHandle =
+                  inputHandles.length > 0 ? inputHandles[inputHandles.length - 1] : null;
+                if (inputHandle) {
+                  await inputHandle.click();
+                  await page.waitForTimeout(100);
+                  await inputHandle.fill(step.value);
+                  await page.waitForTimeout(100);
+                  await inputHandle.press('Tab');
+                  directFilled = true;
+                  debug(`Direct fill: entered "${step.value}" in "${fieldName}"`);
+                }
+              }
+            }
+          }
+
+          if (!directFilled) {
+            debug(`Falling back to DN.playRecording for "${fieldName}"`);
+            const singleStep = { ...recording, steps: [step] };
+            await currentFrame.evaluate((data) => {
+              const DN = (window as unknown as Record<string, unknown>)['DN'] as Record<
+                string,
+                (...args: unknown[]) => unknown
+              >;
+              return DN['playRecording'](data);
+            }, singleStep as unknown);
+          }
+
+          if (isInvestigate) {
+            stepDiscovery.inputMethod = directFilled ? 'directFill' : 'dnPlayRecording';
+            info(`  → inputMethod: ${stepDiscovery.inputMethod}`);
+          }
+
+          // In record mode: re-scroll to show the filled field and animate cursor
+          if (!isInvestigate && fieldName) {
+            await page.waitForTimeout(300);
+            const postFrame = await awaitBCFrame(page, 5_000).catch(() => currentFrame);
+            await scrollFieldToCenter(postFrame, page, fieldName);
+            await animateCursorToField(postFrame, page, fieldName);
+          }
+        } else if (step.type === 'scope' && step.steps) {
+          // Scope: execute inner steps sequentially within this timing slot
+          debug(`Scope: executing ${step.steps.length} inner steps`);
+          for (const innerStep of step.steps) {
+            const innerDesc = cleanDescription(innerStep.description ?? innerStep.caption ?? '');
+            debug(`  Scope inner: ${innerDesc}`);
+
+            let innerFrame: Frame;
+            try {
+              innerFrame = await awaitBCFrame(page, 10_000);
+            } catch {
+              innerFrame = currentFrame;
+            }
+
+            if (innerStep.type === 'action' && innerStep.row) {
+              await clickBCRow(innerFrame, innerStep.row, isInvestigate ? undefined : page);
+            } else if (innerStep.type === 'action' && innerStep.caption) {
+              const clicked = await clickBCAction(innerFrame, page, innerStep.caption);
+              if (!clicked) {
+                info(`  WARNING: Could not find "${innerStep.caption}" in scope`);
+              }
+            } else if (innerStep.type === 'input' && innerStep.value) {
+              const innerFieldName = innerStep.target?.find((t) => t.field)?.field;
+              if (innerFieldName) {
+                if (!isInvestigate) {
+                  await scrollFieldToCenter(innerFrame, page, innerFieldName);
+                  await animateCursorToField(innerFrame, page, innerFieldName);
+                }
+
+                let innerFilled = false;
+                // Boolean toggle
+                const isBool =
+                  innerStep.value.toLowerCase() === 'true' ||
+                  innerStep.value.toLowerCase() === 'false';
+                if (isBool) {
+                  const checkHandles = await innerFrame.$$(
+                    `td[controlname="${innerFieldName}"] input[type="checkbox"], td[controlname="${innerFieldName}"] [role="checkbox"]`,
+                  );
+                  const checkHandle =
+                    checkHandles.length > 0 ? checkHandles[checkHandles.length - 1] : null;
+                  if (checkHandle) {
+                    const wantChecked = innerStep.value.toLowerCase() === 'true';
+                    const isChecked = await checkHandle
+                      .isChecked()
+                      .catch(() => checkHandle.evaluate((el) => (el as HTMLInputElement).checked));
+                    if (isChecked !== wantChecked) {
+                      await checkHandle.click();
+                      debug(`  Toggled checkbox "${innerFieldName}" → ${wantChecked}`);
+                    }
+                    await page.waitForTimeout(100);
+                    innerFilled = true;
+                  }
+                }
+                // Text fallback
+                if (!innerFilled) {
+                  const inputHandles = await innerFrame.$$(
+                    `td[controlname="${innerFieldName}"] input, td[controlname="${innerFieldName}"] [role="textbox"]`,
+                  );
+                  const inputHandle =
+                    inputHandles.length > 0 ? inputHandles[inputHandles.length - 1] : null;
+                  if (inputHandle) {
+                    await inputHandle.click();
+                    await page.waitForTimeout(100);
+                    await inputHandle.fill(innerStep.value);
+                    await page.waitForTimeout(100);
+                    await inputHandle.press('Tab');
+                    innerFilled = true;
+                  }
+                }
+                if (!innerFilled) {
+                  debug(`  Scope inner: falling back to DN.playRecording for "${innerFieldName}"`);
+                  const singleStep = { ...recording, steps: [innerStep] };
+                  await innerFrame.evaluate((data) => {
+                    const DN = (window as unknown as Record<string, unknown>)['DN'] as Record<
+                      string,
+                      (...args: unknown[]) => unknown
+                    >;
+                    return DN['playRecording'](data);
+                  }, singleStep as unknown);
+                }
+              }
+            }
+
+            await page.waitForTimeout(isInvestigate ? 200 : 400);
+            await awaitBCFrame(page, 10_000).catch(() => {});
+          }
+        }
+      } catch (stepError) {
+        const msg = stepError instanceof Error ? stepError.message : String(stepError);
+        if (isInvestigate) {
+          // In investigate mode: log warning, record partial discovery, continue
+          info(`  WARNING: Step ${i + 1} failed: ${msg}`);
+          stepDiscovery.fieldFound = false;
+        } else {
+          throw stepError; // In record mode: propagate errors as before
+        }
+      }
+
+      // Collect discovery for this step
+      if (isInvestigate) {
+        discoveries.push(stepDiscovery);
+      }
+
       // Wait for BC to respond to the click, then wait until idle
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(isInvestigate ? 200 : 500);
+
+      // Wait for BC transition overlays (spa-dialog fadeout) to clear
+      try {
+        await page.waitForFunction(
+          () => {
+            const overlays = document.querySelectorAll('.spa-view.spa-dialog');
+            for (const el of overlays) {
+              const style = window.getComputedStyle(el);
+              if (
+                style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                parseFloat(style.opacity) > 0
+              ) {
+                return false;
+              }
+            }
+            return true;
+          },
+          { timeout: 10_000 },
+        );
+      } catch {
+        debug('spa-dialog overlay still present after 10s — continuing');
+      }
+
       try {
         const postFrame = await awaitBCFrame(page, 15_000);
-        // Log what's on the page after this step
         const postSnap = await postFrame.evaluate(() => {
           const btns: string[] = [];
           document.querySelectorAll('button, [role="button"], [role="menuitem"]').forEach((el) => {
@@ -345,43 +1174,66 @@ export async function playDemo(
         debug('(page still loading after step...)');
       }
 
-      // Overlap narration delay with BC load time — only wait the remainder
-      const delay = options?.stepDelays?.get(i) ?? NAV_DELAY_MS;
-      const elapsed = Date.now() - stepStartTime;
-      const remaining = Math.max(0, delay - elapsed);
-      if (remaining > 0) {
-        await page.waitForTimeout(remaining);
+      // In record mode: overlap narration delay with BC load time
+      if (!isInvestigate) {
+        const delay = options?.stepDelays?.get(i) ?? NAV_DELAY_MS;
+        const elapsed = Date.now() - stepStartTime;
+        const remaining = Math.max(0, delay - elapsed);
+        if (remaining > 0) {
+          await page.waitForTimeout(remaining);
+        }
+        debug(
+          `Step timing: ${elapsed}ms elapsed (BC load), ${remaining}ms extra wait, ${delay}ms target`,
+        );
       }
-      debug(
-        `Step timing: ${elapsed}ms elapsed (BC load), ${remaining}ms extra wait, ${delay}ms target`,
-      );
 
       const stepEndMs = Date.now() - videoStartMs;
       timingSteps.push({ stepIndex: i, startMs: stepStartMs, endMs: stepEndMs });
     }
 
-    // Final delay so the video captures the end state
-    debug('Recording complete, capturing final state...');
-    await page.waitForTimeout(END_DELAY_MS);
+    if (!isInvestigate) {
+      // Final delay so the video captures the end state
+      debug('Recording complete, capturing final state...');
+      await page.waitForTimeout(END_DELAY_MS);
+    }
 
-    // Build timing metadata — trim the "Getting Ready" loading screen
+    // Build timing metadata
     timing = { trimStartMs, steps: timingSteps };
 
-    // Save timing JSON for --skip-record reuse
-    const timingPath = resolve(outputDir, `${specName}.timing.json`);
-    writeFileSync(timingPath, JSON.stringify(timing, null, 2));
-    debug(`Timing saved: ${timingPath}`);
+    if (!isInvestigate) {
+      // Save timing JSON for --skip-record reuse
+      const timingPath = resolve(outputDir, `${specName}.timing.json`);
+      writeFileSync(timingPath, JSON.stringify(timing, null, 2));
+      debug(`Timing saved: ${timingPath}`);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`Player error: ${message}`);
-    const videoPath = await page.video()?.path();
+    if (!isInvestigate) {
+      const videoPath = await page.video()?.path();
+      await context.close();
+      await browser.close();
+      if (videoPath) {
+        const finalPath = resolve(outputDir, `${specName}.webm`);
+        copyFileSync(videoPath, finalPath);
+      }
+    } else {
+      // Pad discoveries to match step count so enricher can map them 1:1
+      while (discoveries.length < recording.steps.length) {
+        discoveries.push({ fieldFound: false });
+      }
+      await context.close();
+      await browser.close();
+    }
+    return { success: false, error: message, discoveries: isInvestigate ? discoveries : undefined };
+  }
+
+  // In investigate mode: clean up and return discoveries
+  if (isInvestigate) {
     await context.close();
     await browser.close();
-    if (videoPath) {
-      const finalPath = resolve(outputDir, `${specName}.webm`);
-      copyFileSync(videoPath, finalPath);
-    }
-    return { success: false, error: message };
+    info(`Investigation complete — ${discoveries.length} steps analyzed`);
+    return { success: true, discoveries };
   }
 
   // Save video with proper name
@@ -399,162 +1251,6 @@ export async function playDemo(
   return { success: false, error: 'No video was recorded' };
 }
 
-/**
- * After BC navigates to a field (e.g. via DN.playRecording), the field may be
- * barely in view at the edge of the viewport. This function finds the field,
- * checks if it's outside the middle ~60% of the viewport, and if so scrolls
- * its nearest scrollable ancestor to center it.
- */
-/**
- * If a field is inside a collapsed FastTab, click the FastTab header to
- * expand it so the field becomes visible before we try to move the cursor.
- * BC renders FastTabs as elements with class "collapsibleTab" and a
- * clickable header with aria-expanded that toggles the content.
- */
-async function expandFastTabForField(frame: Frame, page: Page, fieldName: string): Promise<void> {
-  const headerToClick = await frame.evaluate((name: string) => {
-    // Find the field element — even if it has a 0x0 rect (collapsed)
-    function findFieldElement(): Element | null {
-      for (const el of document.querySelectorAll(`[aria-label*="${name}"], [title*="${name}"]`)) {
-        return el;
-      }
-      for (const el of document.querySelectorAll(
-        'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]',
-      )) {
-        if (el.getAttribute('aria-label')?.includes(name)) return el;
-      }
-      for (const cap of document.querySelectorAll(
-        'label, [class*="caption"], [class*="Caption"]',
-      )) {
-        if (cap.textContent?.trim() === name || cap.textContent?.includes(name)) {
-          return cap;
-        }
-      }
-      return null;
-    }
-
-    const field = findFieldElement();
-    if (!field) return null;
-
-    // Check if the field is already visible (not collapsed)
-    const rect = (field as HTMLElement).getBoundingClientRect();
-    if (rect.width > 0 && rect.height > 0) return null;
-
-    // Walk up to find the collapsed FastTab container
-    let el: Element | null = field;
-    while (el) {
-      // Look for a FastTab header that is collapsed (aria-expanded="false")
-      const header = el.querySelector('[aria-expanded="false"]');
-      if (header) {
-        const headerRect = (header as HTMLElement).getBoundingClientRect();
-        if (headerRect.width > 0 && headerRect.height > 0) {
-          return {
-            x: headerRect.x + headerRect.width / 2,
-            y: headerRect.y + headerRect.height / 2,
-          };
-        }
-      }
-      // Also check if this element itself is a collapsed header's content
-      if (
-        el.classList?.contains('collapsibleTab') ||
-        el.classList?.contains('collapsibleTab-container')
-      ) {
-        const header =
-          el.querySelector('[aria-expanded="false"]') ??
-          el.previousElementSibling?.querySelector('[aria-expanded="false"]') ??
-          el.parentElement?.querySelector('[aria-expanded="false"]');
-        if (header) {
-          const headerRect = (header as HTMLElement).getBoundingClientRect();
-          if (headerRect.width > 0 && headerRect.height > 0) {
-            return {
-              x: headerRect.x + headerRect.width / 2,
-              y: headerRect.y + headerRect.height / 2,
-            };
-          }
-        }
-      }
-      el = el.parentElement;
-    }
-
-    return null;
-  }, fieldName);
-
-  if (headerToClick) {
-    debug(`Expanding collapsed FastTab for field "${fieldName}"`);
-    await frame.evaluate(({ x, y }) => {
-      const el = document.elementFromPoint(x, y) as HTMLElement | null;
-      el?.click();
-    }, headerToClick);
-    await page.waitForTimeout(500);
-    await awaitBCFrame(page, 10_000).catch(() => {});
-  }
-
-  // After expanding the FastTab, the field may still be hidden behind a
-  // "Show more" link. Check if the field is visible; if not, find and
-  // click "Show more" within the same FastTab.
-  const showMoreToClick = await frame.evaluate((name: string) => {
-    function findFieldElement(): Element | null {
-      for (const el of document.querySelectorAll(`[aria-label*="${name}"], [title*="${name}"]`)) {
-        return el;
-      }
-      for (const el of document.querySelectorAll(
-        'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]',
-      )) {
-        if (el.getAttribute('aria-label')?.includes(name)) return el;
-      }
-      for (const cap of document.querySelectorAll(
-        'label, [class*="caption"], [class*="Caption"]',
-      )) {
-        if (cap.textContent?.trim() === name || cap.textContent?.includes(name)) return cap;
-      }
-      return null;
-    }
-
-    const field = findFieldElement();
-    if (!field) return null;
-
-    const rect = (field as HTMLElement).getBoundingClientRect();
-    if (rect.width > 0 && rect.height > 0) return null; // already visible
-
-    // Walk up to find the FastTab container, then look for "Show more" inside it
-    let container: Element | null = field;
-    while (container) {
-      if (
-        container.classList?.contains('collapsibleTab') ||
-        container.classList?.contains('collapsibleTab-container') ||
-        container.getAttribute('role') === 'tabpanel' ||
-        container.getAttribute('role') === 'group'
-      ) {
-        break;
-      }
-      container = container.parentElement;
-    }
-
-    // Search for "Show more" link — in the FastTab container if found, otherwise the whole document
-    const scope = container ?? document;
-    for (const el of scope.querySelectorAll('a, button, [role="button"], [role="link"], span')) {
-      const text = (el as HTMLElement).innerText?.trim().toLowerCase();
-      if (text === 'show more' || text === 'vis mere' || text === 'mehr anzeigen') {
-        const r = (el as HTMLElement).getBoundingClientRect();
-        if (r.width > 0 && r.height > 0) {
-          return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-        }
-      }
-    }
-    return null;
-  }, fieldName);
-
-  if (showMoreToClick) {
-    debug(`Clicking "Show more" for field "${fieldName}"`);
-    await frame.evaluate(({ x, y }) => {
-      const el = document.elementFromPoint(x, y) as HTMLElement | null;
-      el?.click();
-    }, showMoreToClick);
-    await page.waitForTimeout(500);
-    await awaitBCFrame(page, 10_000).catch(() => {});
-  }
-}
-
 async function scrollFieldToCenter(frame: Frame, page: Page, fieldName: string): Promise<void> {
   const viewportWidth = 1920;
   const viewportHeight = 1080;
@@ -565,52 +1261,61 @@ async function scrollFieldToCenter(frame: Frame, page: Page, fieldName: string):
 
   const result = await frame.evaluate(
     ({ name, zoneTop, zoneBottom, zoneLeft, zoneRight }) => {
-      // Find the field element in BC DOM
+      // Find the field element in BC DOM.
+      // NOTE: This duplicates strategies from findFieldInFrame() because
+      // we need find + scroll in a single evaluate() round-trip. When
+      // adding new strategies, update findFieldInFrame() as the canonical list.
+      // Prefers the LAST visible match (edit-mode elements come last in DOM).
       function findField(): Element | null {
         function visible(el: Element) {
           const r = (el as HTMLElement).getBoundingClientRect();
           return r.width > 0 && r.height > 0;
         }
         // Strategy 1: BC grid cell — td[controlname] contains the input
+        let last: Element | null = null;
         for (const td of document.querySelectorAll(`td[controlname="${name}"]`)) {
           const input = td.querySelector(
             'input, textarea, select, [role="textbox"], [role="combobox"]',
           );
-          if (input && visible(input)) return input;
-          if (visible(td)) return td;
+          if (input && visible(input)) last = input;
+          else if (visible(td)) last = td;
         }
+        if (last) return last;
         // Strategy 2: Exact aria-label match
         for (const el of document.querySelectorAll(`[aria-label="${name}"]`)) {
-          if (visible(el)) return el;
+          if (visible(el)) last = el;
         }
+        if (last) return last;
         // Strategy 3: Input elements with substring aria-label match
         for (const el of document.querySelectorAll(
           'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]',
         )) {
           if (el.getAttribute('aria-label')?.includes(name)) {
-            if (visible(el)) return el;
+            if (visible(el)) last = el;
           }
         }
-        // Strategy 4: Substring aria-label — pick shortest label (most specific)
+        if (last) return last;
+        // Strategy 4: Substring aria-label — pick shortest label (most specific), last of those
         const candidates: Element[] = [];
         for (const el of document.querySelectorAll(`[aria-label*="${name}"]`)) {
           if (el.getAttribute('aria-label')?.startsWith('Open menu for')) continue;
           if (visible(el)) candidates.push(el);
         }
         if (candidates.length > 0) {
-          candidates.sort(
-            (a, b) =>
-              (a.getAttribute('aria-label')?.length ?? 0) -
-              (b.getAttribute('aria-label')?.length ?? 0),
+          const minLen = Math.min(
+            ...candidates.map((c) => c.getAttribute('aria-label')?.length ?? 0),
           );
-          return candidates[0];
+          const shortest = candidates.filter(
+            (c) => (c.getAttribute('aria-label')?.length ?? 0) === minLen,
+          );
+          return shortest[shortest.length - 1];
         }
         // Strategy 5: Title attribute match (skip "Open Menu" links)
         for (const el of document.querySelectorAll(`[title*="${name}"]`)) {
           if (el.getAttribute('title') === 'Open Menu') continue;
-          if (visible(el)) return el;
+          if (visible(el)) last = el;
         }
-        return null;
+        return last;
       }
 
       const el = findField();
@@ -756,88 +1461,12 @@ async function scrollFieldToCenter(frame: Frame, page: Page, fieldName: string):
  * Returns true if the cursor was moved, false if the field wasn't found or visible.
  */
 async function animateCursorToField(frame: Frame, page: Page, fieldName: string): Promise<boolean> {
-  const fieldBox = await frame.evaluate((name: string) => {
-    function center(el: Element) {
-      const rect = (el as HTMLElement).getBoundingClientRect();
-      if (rect.width === 0 && rect.height === 0) return null;
-      return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-    }
-
-    // Strategy 1: BC grid cell — td[controlname] contains the input
-    for (const td of document.querySelectorAll(`td[controlname="${name}"]`)) {
-      const input = td.querySelector(
-        'input, textarea, select, [role="textbox"], [role="combobox"]',
-      );
-      if (input) {
-        const c = center(input);
-        if (c) return c;
-      }
-      const c = center(td);
-      if (c) return c;
-    }
-
-    // Strategy 2: Exact aria-label match
-    for (const el of document.querySelectorAll(`[aria-label="${name}"]`)) {
-      const c = center(el);
-      if (c) return c;
-    }
-
-    // Strategy 3: Input elements with substring aria-label match
-    for (const el of document.querySelectorAll(
-      'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]',
-    )) {
-      if (el.getAttribute('aria-label')?.includes(name)) {
-        const c = center(el);
-        if (c) return c;
-      }
-    }
-
-    // Strategy 4: Substring aria-label — pick shortest label (most specific match)
-    const candidates: Array<{ el: Element; len: number }> = [];
-    for (const el of document.querySelectorAll(`[aria-label*="${name}"]`)) {
-      if (el.getAttribute('aria-label')?.startsWith('Open menu for')) continue;
-      const c = center(el);
-      if (c) candidates.push({ el, len: el.getAttribute('aria-label')?.length ?? 0 });
-    }
-    if (candidates.length > 0) {
-      candidates.sort((a, b) => a.len - b.len);
-      const c = center(candidates[0].el);
-      if (c) return c;
-    }
-
-    // Strategy 5: Element with matching title attribute (skip "Open Menu" links)
-    for (const el of document.querySelectorAll(`[title*="${name}"]`)) {
-      if (el.getAttribute('title') === 'Open Menu') continue;
-      const c = center(el);
-      if (c) return c;
-    }
-
-    // Strategy 6: Find caption text, target its sibling value element
-    for (const cap of document.querySelectorAll('label, [class*="caption"], [class*="Caption"]')) {
-      if (cap.textContent?.trim() === name || cap.textContent?.includes(name)) {
-        const parent = cap.parentElement;
-        if (parent) {
-          const ctrl = parent.querySelector(
-            'input, textarea, select, [role="textbox"], [role="combobox"], [contenteditable="true"]',
-          );
-          if (ctrl) {
-            const c = center(ctrl);
-            if (c) return c;
-          }
-          const sibling = cap.nextElementSibling;
-          if (sibling) {
-            const c = center(sibling);
-            if (c) return c;
-          }
-        }
-      }
-    }
-
-    return null;
-  }, fieldName);
+  const fieldBox = await findFieldInFrame(frame, fieldName);
 
   if (fieldBox) {
-    debug(`Cursor -> field "${fieldName}" at (${fieldBox.x}, ${fieldBox.y})`);
+    debug(
+      `Cursor -> field "${fieldName}" at (${fieldBox.x}, ${fieldBox.y}) [${fieldBox.strategy}]`,
+    );
     await cursorClickAt(page, frame, fieldBox.x, fieldBox.y);
     return true;
   }
@@ -854,55 +1483,12 @@ async function clickAssistEdit(frame: Frame, page: Page, fieldCaption: string): 
   debug(`Assist-edit: locating field "${fieldCaption}"...`);
 
   // Expand FastTab / Show More if the field is hidden
-  await expandFastTabForField(frame, page, fieldCaption);
+  await prepareFieldAccess(frame, page, fieldCaption);
   await scrollFieldToCenter(frame, page, fieldCaption);
 
   // Step 1: Find the field value element and click it to give it focus.
   // This makes BC render the assist-edit button.
-  const fieldBox = await frame.evaluate((name: string) => {
-    function center(el: Element) {
-      const rect = (el as HTMLElement).getBoundingClientRect();
-      if (rect.width === 0 && rect.height === 0) return null;
-      return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-    }
-
-    // Strategy 1: aria-label or title match → prefer input/control elements
-    for (const el of document.querySelectorAll(
-      `input[aria-label*="${name}"], [role="textbox"][aria-label*="${name}"], [role="combobox"][aria-label*="${name}"]`,
-    )) {
-      const c = center(el);
-      if (c) return c;
-    }
-
-    // Strategy 2: Any element with matching aria-label
-    for (const el of document.querySelectorAll(`[aria-label*="${name}"]`)) {
-      const c = center(el);
-      if (c) return c;
-    }
-
-    // Strategy 3: Caption label → sibling value element
-    for (const cap of document.querySelectorAll('label, [class*="caption"], [class*="Caption"]')) {
-      if (cap.textContent?.trim() === name || cap.textContent?.includes(name)) {
-        const parent = cap.parentElement;
-        if (parent) {
-          const ctrl = parent.querySelector(
-            'input, textarea, select, [role="textbox"], [role="combobox"], [contenteditable="true"]',
-          );
-          if (ctrl) {
-            const c = center(ctrl);
-            if (c) return c;
-          }
-          const sibling = cap.nextElementSibling;
-          if (sibling) {
-            const c = center(sibling);
-            if (c) return c;
-          }
-        }
-      }
-    }
-
-    return null;
-  }, fieldCaption);
+  const fieldBox = await findFieldInFrame(frame, fieldCaption);
 
   if (!fieldBox) {
     info(`  WARNING: Assist-edit — could not find field "${fieldCaption}"`);
@@ -1024,12 +1610,15 @@ async function clickBCRow(frame: Frame, rowTarget: number | string, page?: Page)
       }
       const scope = getScope();
 
+      // Reverse iteration: edit-mode grid comes last in DOM order
       function getDataRows(): Element[] {
-        const tables = scope.querySelectorAll(
-          'table.ms-nav-grid-data-table, table[class*="ms-nav-grid"][class*="data"]',
+        const tables = Array.from(
+          scope.querySelectorAll(
+            'table.ms-nav-grid-data-table, table[class*="ms-nav-grid"][class*="data"]',
+          ),
         );
-        for (const table of tables) {
-          const rows = Array.from(table.querySelectorAll('tbody > tr, tr[role="row"]'));
+        for (let i = tables.length - 1; i >= 0; i--) {
+          const rows = Array.from(tables[i].querySelectorAll('tbody > tr, tr[role="row"]'));
           const data = rows.filter(
             (r) =>
               !r.querySelector('th') &&
@@ -1041,16 +1630,17 @@ async function clickBCRow(frame: Frame, rowTarget: number | string, page?: Page)
           );
           if (data.length > 0) return data;
         }
-        const grids = scope.querySelectorAll('[role="grid"]');
-        for (const grid of grids) {
-          const rows = Array.from(grid.querySelectorAll('[role="row"]'));
-          return rows.filter(
+        const grids = Array.from(scope.querySelectorAll('[role="grid"]'));
+        for (let i = grids.length - 1; i >= 0; i--) {
+          const rows = Array.from(grids[i].querySelectorAll('[role="row"]'));
+          const data = rows.filter(
             (r) =>
               !r.querySelector('[role="columnheader"]') &&
               Array.from(r.querySelectorAll('[role="gridcell"]')).some((c) =>
                 (c as HTMLElement).textContent?.trim(),
               ),
           );
+          if (data.length > 0) return data;
         }
         return [];
       }
@@ -1098,12 +1688,17 @@ async function clickBCRow(frame: Frame, rowTarget: number | string, page?: Page)
     }
     const scope = getScope();
 
+    // When BC enters edit mode, duplicate grids appear in the DOM.
+    // The edit-mode grid comes LAST in document order. Iterate in
+    // reverse so we pick the topmost (edit-mode) grid.
     function getDataRows(): Element[] {
-      const tables = scope.querySelectorAll(
-        'table.ms-nav-grid-data-table, table[class*="ms-nav-grid"][class*="data"]',
+      const tables = Array.from(
+        scope.querySelectorAll(
+          'table.ms-nav-grid-data-table, table[class*="ms-nav-grid"][class*="data"]',
+        ),
       );
-      for (const table of tables) {
-        const rows = Array.from(table.querySelectorAll('tbody > tr, tr[role="row"]'));
+      for (let i = tables.length - 1; i >= 0; i--) {
+        const rows = Array.from(tables[i].querySelectorAll('tbody > tr, tr[role="row"]'));
         const data = rows.filter(
           (r) =>
             !r.querySelector('th') &&
@@ -1115,16 +1710,17 @@ async function clickBCRow(frame: Frame, rowTarget: number | string, page?: Page)
         );
         if (data.length > 0) return data;
       }
-      const grids = scope.querySelectorAll('[role="grid"]');
-      for (const grid of grids) {
-        const rows = Array.from(grid.querySelectorAll('[role="row"]'));
-        return rows.filter(
+      const grids = Array.from(scope.querySelectorAll('[role="grid"]'));
+      for (let i = grids.length - 1; i >= 0; i--) {
+        const rows = Array.from(grids[i].querySelectorAll('[role="row"]'));
+        const data = rows.filter(
           (r) =>
             !r.querySelector('[role="columnheader"]') &&
             Array.from(r.querySelectorAll('[role="gridcell"]')).some((c) =>
               (c as HTMLElement).textContent?.trim(),
             ),
         );
+        if (data.length > 0) return data;
       }
       return [];
     }
@@ -1203,13 +1799,17 @@ async function clickBCAction(frame: Frame, page: Page, caption: string): Promise
     return true; // Return true to avoid fallback/warning — the dialog already closed
   }
 
+  // When BC enters edit mode, it renders duplicate buttons/menuitems.
+  // The edit-mode versions come last in DOM order → use .last() to
+  // target the topmost (interactive) instance.
+
   // Strategy 1: Exact match button/menuitem by accessible name
   for (const role of ['button', 'menuitem', 'link'] as const) {
     const locator = frame.getByRole(role, { name: caption, exact: true });
     if ((await locator.count()) > 0) {
       debug(`Clicking [${role}] "${caption}"`);
-      await animateCursorToLocator(page, frame, locator);
-      await locator.first().click();
+      await animateCursorToLocator(page, frame, locator.last());
+      await locator.last().click();
       return true;
     }
   }
@@ -1219,8 +1819,8 @@ async function clickBCAction(frame: Frame, page: Page, caption: string): Promise
     const locator = frame.getByRole(role, { name: caption });
     if ((await locator.count()) > 0) {
       debug(`Clicking [${role}] containing "${caption}" (partial match)`);
-      await animateCursorToLocator(page, frame, locator);
-      await locator.first().click();
+      await animateCursorToLocator(page, frame, locator.last());
+      await locator.last().click();
       return true;
     }
   }
@@ -1231,8 +1831,8 @@ async function clickBCAction(frame: Frame, page: Page, caption: string): Promise
   );
   if ((await textLocator.count()) > 0) {
     debug(`Clicking element containing text "${caption}"`);
-    await animateCursorToLocator(page, frame, textLocator);
-    await textLocator.first().click();
+    await animateCursorToLocator(page, frame, textLocator.last());
+    await textLocator.last().click();
     return true;
   }
 
@@ -1240,8 +1840,8 @@ async function clickBCAction(frame: Frame, page: Page, caption: string): Promise
   const byText = frame.getByText(caption, { exact: true });
   if ((await byText.count()) > 0) {
     debug(`Clicking text "${caption}" (getByText)`);
-    await animateCursorToLocator(page, frame, byText);
-    await byText.first().click();
+    await animateCursorToLocator(page, frame, byText.last());
+    await byText.last().click();
     return true;
   }
 

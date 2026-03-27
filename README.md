@@ -42,6 +42,8 @@ Output lands in `output/<spec-name>.mp4`.
 
 | Flag | Description |
 |------|-------------|
+| `--bc-url <url>` | Business Central web client URL (overrides `BC_START_ADDRESS` from `.env`) |
+| `--bc-auth <type>` | Authentication type: `Windows`, `AAD`, or `UserPassword` (overrides `BC_AUTH` from `.env`) |
 | `--narrate` | Generate per-step TTS narration and compose final video |
 | `--voice <name>` | OpenAI voice: `alloy`, `echo`, `fable`, `onyx`, `nova` (default), `shimmer` |
 | `--skip-record` | Skip browser recording, recompose from existing video |
