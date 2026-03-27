@@ -2,24 +2,20 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { resolve, parse as parsePath } from 'path';
 import { parse as parseYaml } from 'yaml';
-import type { Page } from 'playwright';
-import { VisionClient, type PageSurvey } from './vision.js';
+import type { Page, Frame } from 'playwright';
+import { VisionClient } from './vision.js';
+import { DomInterpreter } from './dom-interpreter.js';
+import { extractPageHtml } from './dom-extract.js';
+import { loadPatterns, savePattern, incrementSuccess, type KnowledgePattern } from './knowledge.js';
 import { launchBCSession, closeBCSession, awaitBCFrame } from './browser.js';
 import { computeSpecHash, writeScript } from './script-io.js';
-import type {
-  ScriptFile,
-  ScriptStep,
-  ScriptStepSource,
-  PrepAction,
-  LocateResult,
-} from './script-types.js';
+import type { ScriptFile, ScriptStep, ScriptStepSource, VerifyResult } from './script-types.js';
 import { DemoConfig } from './config.js';
 import { info, debug } from './log.js';
 
 const MAX_RETRIES = 3;
 const POST_ACTION_WAIT_MS = 4000;
-const SURVEY_SCROLL_STEPS = 4; // number of scroll positions to capture
-const SURVEY_SCROLL_PX = 400; // pixels to scroll per step
+const BC_IDLE_TIMEOUT_MS = 10_000;
 
 interface YamlSpec {
   description?: string;
@@ -50,7 +46,7 @@ interface YamlSpec {
   }>;
 }
 
-/** Converts a YAML step to a ScriptStepSource for vision prompts. */
+/** Converts a YAML step to a ScriptStepSource for prompts. */
 function toSource(step: YamlSpec['steps'][0]): ScriptStepSource {
   return {
     type: step.type,
@@ -71,132 +67,7 @@ async function captureScreenshot(page: Page, outputDir: string, name: string): P
 }
 
 /**
- * Surveys the current BC page by expanding all FastTabs, scrolling through,
- * and taking screenshots at multiple positions. Returns a structured description
- * of the COMPLETE page layout including all fields in all sections.
- */
-async function surveyCurrentPage(
-  vision: VisionClient,
-  page: Page,
-  outputDir: string,
-  label: string,
-): Promise<PageSurvey> {
-  // Step 1: On card/document pages, expand collapsed FastTabs and "Show more"
-  // so the survey sees every field. Skip this on list pages to avoid navigating away.
-  try {
-    const frame = await awaitBCFrame(page, 5_000);
-    const hasCardForm = await frame.evaluate(
-      () =>
-        !!document.querySelector(
-          'div.ms-nav-cardform, [class*="ms-nav-card"], [class*="collapsibleTab"]',
-        ),
-    );
-
-    if (hasCardForm) {
-      // Expand collapsed FastTabs (scoped to the card form area)
-      const expandedCount = await frame.evaluate(() => {
-        let count = 0;
-        const cardForm =
-          document.querySelector('div.ms-nav-cardform, [class*="ms-nav-card"]') ?? document.body;
-        for (const header of cardForm.querySelectorAll('[aria-expanded="false"]')) {
-          const rect = (header as HTMLElement).getBoundingClientRect();
-          if (rect.width > 100 && rect.height > 10 && rect.height < 60) {
-            (header as HTMLElement).click();
-            count++;
-          }
-        }
-        return count;
-      });
-      if (expandedCount > 0) {
-        info(`  Expanded ${expandedCount} collapsed FastTab(s)`);
-        await page.waitForTimeout(1500);
-        try {
-          await awaitBCFrame(page, 5_000);
-        } catch {
-          /* */
-        }
-      }
-
-      // Click "Show more" links
-      const showMoreCount = await frame.evaluate(() => {
-        let count = 0;
-        for (const el of document.querySelectorAll('a, button, [role="button"], span')) {
-          const text = (el as HTMLElement).innerText?.trim().toLowerCase();
-          if (text === 'show more' || text === 'vis mere' || text === 'mehr anzeigen') {
-            const rect = (el as HTMLElement).getBoundingClientRect();
-            if (rect.width > 0 && rect.height > 0) {
-              (el as HTMLElement).click();
-              count++;
-            }
-          }
-        }
-        return count;
-      });
-      if (showMoreCount > 0) {
-        info(`  Clicked ${showMoreCount} "Show more" link(s)`);
-        await page.waitForTimeout(1000);
-        try {
-          await awaitBCFrame(page, 5_000);
-        } catch {
-          /* */
-        }
-      }
-    } else {
-      debug('  Not a card page — skipping FastTab expansion');
-    }
-  } catch {
-    /* non-critical */
-  }
-
-  // Step 3: Scroll to top
-  try {
-    const frame = await awaitBCFrame(page, 5_000);
-    await frame.evaluate(() => window.scrollTo(0, 0));
-    await page.waitForTimeout(300);
-  } catch {
-    /* non-critical */
-  }
-
-  // Step 4: Capture screenshots at multiple scroll positions
-  const screenshots: Buffer[] = [];
-  for (let i = 0; i <= SURVEY_SCROLL_STEPS; i++) {
-    const buf = await captureScreenshot(page, outputDir, `survey-${label}-scroll${i}.png`);
-    screenshots.push(buf);
-
-    if (i < SURVEY_SCROLL_STEPS) {
-      await page.mouse.wheel(0, SURVEY_SCROLL_PX);
-      await page.waitForTimeout(500);
-    }
-  }
-
-  // Step 5: Scroll back to top for subsequent steps
-  try {
-    const frame = await awaitBCFrame(page, 5_000);
-    await frame.evaluate(() => window.scrollTo(0, 0));
-    await page.waitForTimeout(300);
-  } catch {
-    /* non-critical */
-  }
-
-  // Step 6: Send all screenshots to vision model for analysis
-  const survey = await vision.surveyPage(screenshots);
-  info(`  Page survey: ${survey.pageType} "${survey.pageTitle}"`);
-  info(
-    `  FastTabs: ${survey.fastTabs.map((ft) => `${ft.name}(${ft.expanded ? 'open' : 'closed'}, ${ft.fields.length} fields)`).join(', ')}`,
-  );
-  for (const ft of survey.fastTabs) {
-    if (ft.fields.length > 0) {
-      info(`    ${ft.name}: ${ft.fields.join(', ')}`);
-    }
-  }
-
-  return survey;
-}
-
-/**
  * Clicks an element in BC by caption/label using Playwright locators on the frame.
- * Vision coordinates can be imprecise (off by 50-100px), so we use the element's
- * text content to find it via Playwright's locator API which clicks the exact center.
  * Falls back to page.mouse.click() at the given coordinates if no label is available.
  */
 async function clickByLabel(
@@ -242,191 +113,343 @@ async function clickByLabel(
   await page.mouse.click(pageX, pageY);
 }
 
-/** Executes a prep action (scroll, click, wait) on the page. */
-async function executePrepAction(page: Page, prep: PrepAction): Promise<void> {
-  if (prep.action === 'scroll' && prep.direction && prep.px) {
-    const deltaX = prep.direction === 'left' ? -prep.px : prep.direction === 'right' ? prep.px : 0;
-    const deltaY = prep.direction === 'up' ? -prep.px : prep.direction === 'down' ? prep.px : 0;
-    await page.mouse.wheel(deltaX, deltaY);
-    await page.waitForTimeout(500);
-  } else if (prep.action === 'click' && prep.coordinates) {
-    await page.mouse.click(prep.coordinates.x, prep.coordinates.y);
-    await page.waitForTimeout(500);
-  } else if (prep.action === 'wait') {
-    await page.waitForTimeout(prep.ms ?? 1000);
+/**
+ * Computes page-level coordinates from a frame-level bounding box by adding
+ * the iframe offset. Returns the center of the element.
+ */
+async function getPageCoordinates(
+  page: Page,
+  frame: Frame,
+  selector: string,
+): Promise<{ x: number; y: number }> {
+  const iframeOffset = await page.evaluate(() => {
+    const iframe = document.querySelector('iframe');
+    if (!iframe) return { x: 0, y: 0 };
+    const rect = iframe.getBoundingClientRect();
+    return { x: rect.x, y: rect.y };
+  });
+
+  const box = await frame.locator(selector).boundingBox();
+  return {
+    x: Math.round((box?.x ?? 0) + (box?.width ?? 0) / 2 + iframeOffset.x),
+    y: Math.round((box?.y ?? 0) + (box?.height ?? 0) / 2 + iframeOffset.y),
+  };
+}
+
+/**
+ * Waits for BC to become idle after an action. Non-critical — silently
+ * ignores timeout so the investigation can continue.
+ */
+async function waitForBCIdle(page: Page): Promise<void> {
+  await page.waitForTimeout(500);
+  try {
+    await awaitBCFrame(page, BC_IDLE_TIMEOUT_MS);
+  } catch {
+    /* non-critical */
   }
 }
 
-/** Runs a single step through the see → act → verify loop. */
+/**
+ * Derives a stable pattern name from a step source, suitable for use as
+ * a file-system-safe knowledge pattern identifier.
+ */
+function patternNameFromSource(source: ScriptStepSource): string {
+  const base =
+    source.type === 'input'
+      ? `input-${source.field ?? 'unknown'}`
+      : source.type === 'action' && source.row != null
+        ? `row-${source.row}`
+        : `action-${source.caption ?? 'unknown'}`;
+  return base
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .slice(0, 60);
+}
+
+/** Runs a single step through the 9-step DOM-based investigation flow. */
 async function investigateStep(
+  interpreter: DomInterpreter,
   vision: VisionClient,
   page: Page,
   source: ScriptStepSource,
   stepIndex: number,
   outputDir: string,
+  knowledgeDir: string,
+  patterns: KnowledgePattern[],
   skipVerify: boolean,
-  pageSurvey?: PageSurvey,
 ): Promise<ScriptStep> {
-  let lastLocate: LocateResult | null = null;
   const pad = String(stepIndex).padStart(2, '0');
+  const targetName =
+    source.caption ??
+    source.field ??
+    (source.row != null ? `row ${source.row}` : `step ${stepIndex}`);
+  const frame = await awaitBCFrame(page, BC_IDLE_TIMEOUT_MS);
 
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    if (attempt > 0) {
-      info(`  Retry ${attempt}/${MAX_RETRIES - 1}...`);
-    }
+  // ─── 1. EXTRACT ──────────────────────────────────────────────────────
+  const { html } = await extractPageHtml(frame);
+  debug(`  [EXTRACT] ${html.length} chars HTML`);
 
-    // SCREENSHOT
-    const beforeBuf = await captureScreenshot(
-      page,
-      outputDir,
-      `step-${pad}-before${attempt > 0 ? `-retry${attempt}` : ''}.png`,
-    );
-
-    // LOCATE — use page survey context if available for more accurate results
-    const locateResult = pageSurvey
-      ? await vision.locateWithContext(beforeBuf, source, pageSurvey)
-      : await vision.locate(beforeBuf, source);
-    lastLocate = locateResult;
+  // ─── 2. SURVEY ───────────────────────────────────────────────────────
+  try {
+    const survey = await interpreter.survey(html, patterns);
     info(
-      `  → ${locateResult.element} at (${locateResult.coordinates.x}, ${locateResult.coordinates.y}) [confidence: ${locateResult.confidence}]`,
+      `  [SURVEY] ${survey.pageType} "${survey.pageTitle}" — ${survey.sections.length} sections, ${survey.actionBar.length} actions`,
     );
+  } catch (err) {
+    info(`  [SURVEY] Failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
-    // PREP — execute prep actions even if confidence is low, because the model
-    // may be saying "element isn't visible yet, do this first" (scroll, expand, etc.)
-    if (locateResult.prep.length > 0) {
-      debug(`  Executing ${locateResult.prep.length} prep actions...`);
-      for (const prep of locateResult.prep) {
-        debug(`    ${prep.action}: ${prep.reason ?? ''}`);
-        await executePrepAction(page, prep);
-      }
+  // ─── 3. LOCATE ───────────────────────────────────────────────────────
+  let locateResult = await interpreter.locate(html, source, patterns);
+  info(
+    `  [LOCATE] found=${locateResult.found} selector="${locateResult.interactSelector}" confidence=${locateResult.confidence}`,
+  );
+  debug(`  [LOCATE] reasoning: ${locateResult.reasoning}`);
 
-      // Wait for BC to settle after prep
-      await page.waitForTimeout(500);
+  // If not found, emit a failed step immediately
+  if (!locateResult.found) {
+    info(`  [LOCATE] WARNING: element not found — "${locateResult.reasoning}"`);
+    return {
+      index: stepIndex,
+      source,
+      action: source.type === 'input' ? 'click-then-type' : 'click',
+      coordinates: { x: 0, y: 0 },
+      value: source.value,
+      confidence: 0,
+      prep: [],
+      verification: { success: false, observation: `Element not found: ${locateResult.reasoning}` },
+      screenshot: `step-${pad}-before.png`,
+    };
+  }
+
+  // ─── 4. PREPARE ──────────────────────────────────────────────────────
+  if (locateResult.stepsToReach.length > 0) {
+    info(`  [PREPARE] ${locateResult.stepsToReach.length} prep step(s)`);
+    for (const prep of locateResult.stepsToReach) {
+      debug(`    ${prep.action}: ${prep.selector} — ${prep.reason ?? ''}`);
       try {
-        await awaitBCFrame(page, 5_000);
-      } catch {
-        /* non-critical */
+        switch (prep.action) {
+          case 'expandSection':
+            await frame.locator(prep.selector).click();
+            await waitForBCIdle(page);
+            break;
+          case 'scrollTo':
+            await frame.locator(prep.selector).scrollIntoViewIfNeeded();
+            break;
+          case 'clickShowMore':
+            await frame.locator(prep.selector).click();
+            await waitForBCIdle(page);
+            break;
+          case 'click':
+            await frame.locator(prep.selector).click();
+            await waitForBCIdle(page);
+            break;
+        }
+      } catch (err) {
+        info(`    Prep step failed: ${err instanceof Error ? err.message : String(err)}`);
       }
-
-      // Re-locate after prep changed the page
-      const afterPrepBuf = await captureScreenshot(
-        page,
-        outputDir,
-        `step-${pad}-after-prep${attempt > 0 ? `-retry${attempt}` : ''}.png`,
-      );
-      const reLocate = pageSurvey
-        ? await vision.locateWithContext(afterPrepBuf, source, pageSurvey)
-        : await vision.locate(afterPrepBuf, source);
-      lastLocate = reLocate;
-      info(
-        `  → Re-located: (${reLocate.coordinates.x}, ${reLocate.coordinates.y}) [confidence: ${reLocate.confidence}]`,
-      );
-    }
-
-    // Skip action if confidence is still too low after prep
-    if (lastLocate.confidence < 0.3) {
-      info(`  Confidence too low (${lastLocate.confidence}), retrying...`);
-      continue;
-    }
-
-    // ACT — use clickByLabel() which finds elements via Playwright locators
-    // for precise clicking, falling back to coordinates if no label is available
-    const coords = lastLocate.coordinates;
-    const label = source.caption ?? source.field;
-
-    if (source.type === 'input' && source.value) {
-      // For input fields: click the field by label, then type
-      await clickByLabel(page, source.field, coords.x, coords.y);
-      await page.waitForTimeout(300);
-      // Select all and type over
-      await page.keyboard.press('Control+a');
-      await page.waitForTimeout(100);
-      await page.keyboard.type(source.value, { delay: 50 });
-      await page.keyboard.press('Tab');
-    } else if (source.assistEdit) {
-      await clickByLabel(page, source.caption, coords.x, coords.y);
-      await page.waitForTimeout(600);
-      const assistBuf = await captureScreenshot(page, outputDir, `step-${pad}-assist.png`);
-      const assistSource: ScriptStepSource = {
-        type: 'action',
-        caption: `assist-edit "..." button for ${source.caption}`,
-      };
-      const assistLocate = await vision.locate(assistBuf, assistSource);
-      if (assistLocate.confidence > 0.3) {
-        await page.mouse.click(assistLocate.coordinates.x, assistLocate.coordinates.y);
-      } else {
-        await page.keyboard.press('F6');
-      }
-    } else if (source.row != null) {
-      // For row clicks: use coordinates (no text label to match)
-      await page.mouse.click(coords.x, coords.y);
-    } else {
-      await clickByLabel(page, label, coords.x, coords.y);
-    }
-
-    await page.waitForTimeout(POST_ACTION_WAIT_MS);
-
-    // Wait for BC to settle
-    try {
-      await awaitBCFrame(page, 10_000);
-    } catch {
-      /* non-critical */
-    }
-
-    // VERIFY
-    if (skipVerify) {
-      return {
-        index: stepIndex,
-        source,
-        action: source.type === 'input' ? 'click-then-type' : 'click',
-        coordinates: coords,
-        value: source.value,
-        confidence: lastLocate.confidence,
-        prep: lastLocate.prep,
-        verification: { success: true, observation: 'verification skipped' },
-        screenshot: `step-${pad}-before.png`,
-      };
-    }
-
-    const afterBuf = await captureScreenshot(page, outputDir, `step-${pad}-after.png`);
-    const verifyResult = await vision.verify(beforeBuf, afterBuf, source, coords);
-    info(
-      `  → Verify: ${verifyResult.success ? 'SUCCESS' : 'FAILED'} — ${verifyResult.observation}`,
-    );
-
-    if (verifyResult.success) {
-      return {
-        index: stepIndex,
-        source,
-        action: source.type === 'input' ? 'click-then-type' : 'click',
-        coordinates: coords,
-        value: source.value,
-        confidence: lastLocate.confidence,
-        prep: lastLocate.prep,
-        verification: verifyResult,
-        screenshot: `step-${pad}-before.png`,
-      };
     }
   }
 
-  // All retries exhausted
-  const fallbackCoords = lastLocate?.coordinates ?? { x: 0, y: 0 };
+  // ─── 5. CONFIRM ──────────────────────────────────────────────────────
+  let confirmedSelector = locateResult.interactSelector;
+  for (let confirmAttempt = 0; confirmAttempt < MAX_RETRIES; confirmAttempt++) {
+    const freshFrame = await awaitBCFrame(page, BC_IDLE_TIMEOUT_MS);
+    const { html: freshHtml } = await extractPageHtml(freshFrame);
+    const confirmResult = await interpreter.confirm(freshHtml, targetName, confirmedSelector);
+    info(`  [CONFIRM] confirmed=${confirmResult.confirmed} selector="${confirmResult.selector}"`);
+    debug(`  [CONFIRM] reasoning: ${confirmResult.reasoning}`);
+
+    if (confirmResult.confirmed) {
+      confirmedSelector = confirmResult.selector;
+      break;
+    }
+
+    // Not confirmed — retry locate with updated HTML
+    if (confirmAttempt < MAX_RETRIES - 1) {
+      info(
+        `  [CONFIRM] Not confirmed, re-locating (attempt ${confirmAttempt + 2}/${MAX_RETRIES})...`,
+      );
+      locateResult = await interpreter.locate(freshHtml, source, patterns);
+      if (!locateResult.found) {
+        info(`  [LOCATE] Element still not found after re-locate`);
+        break;
+      }
+      confirmedSelector = locateResult.interactSelector;
+
+      // Execute any new prep steps
+      if (locateResult.stepsToReach.length > 0) {
+        for (const prep of locateResult.stepsToReach) {
+          try {
+            switch (prep.action) {
+              case 'expandSection':
+                await freshFrame.locator(prep.selector).click();
+                await waitForBCIdle(page);
+                break;
+              case 'scrollTo':
+                await freshFrame.locator(prep.selector).scrollIntoViewIfNeeded();
+                break;
+              case 'clickShowMore':
+                await freshFrame.locator(prep.selector).click();
+                await waitForBCIdle(page);
+                break;
+              case 'click':
+                await freshFrame.locator(prep.selector).click();
+                await waitForBCIdle(page);
+                break;
+            }
+          } catch (err) {
+            info(`    Retry prep step failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+      }
+    }
+  }
+
+  // ─── 6. ACT ──────────────────────────────────────────────────────────
+  // Take before screenshot for verification
+  const beforeBuf = await captureScreenshot(page, outputDir, `step-${pad}-before.png`);
+  const actFrame = await awaitBCFrame(page, BC_IDLE_TIMEOUT_MS);
+
+  try {
+    if (source.type === 'input' && source.value) {
+      // Input: click field, fill, tab out
+      await actFrame.locator(confirmedSelector).click();
+      await page.waitForTimeout(300);
+      await actFrame.locator(confirmedSelector).fill(source.value);
+      await page.keyboard.press('Tab');
+    } else if (source.assistEdit) {
+      // Assist-edit: click the field, wait for assist button to appear
+      await actFrame.locator(confirmedSelector).click();
+      await page.waitForTimeout(600);
+      // Look for the assist-edit "..." button near the field
+      try {
+        const assistBtn = actFrame.locator(
+          `${confirmedSelector} ~ [aria-label*="assist"], [aria-haspopup="dialog"]`,
+        );
+        if ((await assistBtn.count()) > 0) {
+          await assistBtn.first().click();
+        } else {
+          // Fallback: press F6 to trigger assist-edit
+          await page.keyboard.press('F6');
+        }
+      } catch {
+        await page.keyboard.press('F6');
+      }
+    } else if (source.row != null) {
+      // Row click: click using confirmed selector
+      await actFrame.locator(confirmedSelector).click();
+    } else {
+      // Action: try selector first, fall back to clickByLabel
+      try {
+        await actFrame.locator(confirmedSelector).click();
+      } catch {
+        const coords = await getPageCoordinates(page, actFrame, confirmedSelector).catch(() => ({
+          x: 0,
+          y: 0,
+        }));
+        await clickByLabel(page, source.caption, coords.x, coords.y);
+      }
+    }
+    debug(`  [ACT] Executed action with selector "${confirmedSelector}"`);
+  } catch (err) {
+    info(`  [ACT] Selector click failed: ${err instanceof Error ? err.message : String(err)}`);
+    // Fallback to clickByLabel with coordinates if available
+    try {
+      const coords = await getPageCoordinates(page, actFrame, confirmedSelector);
+      await clickByLabel(page, source.caption ?? source.field, coords.x, coords.y);
+    } catch {
+      info(`  [ACT] Fallback also failed — step will be marked as failed`);
+    }
+  }
+
+  await page.waitForTimeout(POST_ACTION_WAIT_MS);
+  await waitForBCIdle(page);
+
+  // ─── 7. VERIFY ───────────────────────────────────────────────────────
+  let verification: VerifyResult;
+  let pageCoords: { x: number; y: number };
+
+  try {
+    const verifyFrame = await awaitBCFrame(page, BC_IDLE_TIMEOUT_MS);
+    pageCoords = await getPageCoordinates(page, verifyFrame, confirmedSelector).catch(() => ({
+      x: 0,
+      y: 0,
+    }));
+  } catch {
+    pageCoords = { x: 0, y: 0 };
+  }
+
+  if (skipVerify) {
+    verification = { success: true, observation: 'verification skipped' };
+  } else {
+    const afterBuf = await captureScreenshot(page, outputDir, `step-${pad}-after.png`);
+    verification = await vision.verify(beforeBuf, afterBuf, source, pageCoords);
+    info(`  [VERIFY] ${verification.success ? 'SUCCESS' : 'FAILED'} — ${verification.observation}`);
+  }
+
+  // ─── 8. LEARN ────────────────────────────────────────────────────────
+  if (verification.success) {
+    const pName = patternNameFromSource(source);
+    try {
+      const existingNames = patterns.map((p) => p.name);
+      if (existingNames.includes(pName)) {
+        incrementSuccess(knowledgeDir, pName);
+        debug(`  [LEARN] Incremented pattern "${pName}"`);
+      } else {
+        const newPattern: KnowledgePattern = {
+          name: pName,
+          description: `${source.type}: ${targetName}`,
+          discovered: new Date().toISOString().split('T')[0],
+          successCount: 1,
+          lastUsed: new Date().toISOString().split('T')[0],
+          pattern: {
+            identify: `selector: ${confirmedSelector}`,
+            interact: source.type === 'input' ? 'click then fill' : 'click',
+            verify: 'before/after screenshot comparison',
+          },
+        };
+        savePattern(knowledgeDir, newPattern);
+        patterns.push(newPattern);
+        debug(`  [LEARN] Saved new pattern "${pName}"`);
+      }
+    } catch (err) {
+      debug(
+        `  [LEARN] Failed to save pattern: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // ─── 9. EMIT ─────────────────────────────────────────────────────────
+  // Get bounding box for final coordinates
+  let emitCoords = pageCoords;
+  try {
+    const emitFrame = await awaitBCFrame(page, 5_000);
+    emitCoords = await getPageCoordinates(page, emitFrame, confirmedSelector);
+  } catch {
+    // Keep pageCoords from verify step
+  }
+
+  const confidenceNum =
+    locateResult.confidence === 'high' ? 0.9 : locateResult.confidence === 'medium' ? 0.6 : 0.3;
+
   return {
     index: stepIndex,
     source,
     action: source.type === 'input' ? 'click-then-type' : 'click',
-    coordinates: fallbackCoords,
+    coordinates: emitCoords,
     value: source.value,
-    confidence: lastLocate?.confidence ?? 0,
-    prep: lastLocate?.prep ?? [],
-    verification: { success: false, observation: `Failed after ${MAX_RETRIES} attempts` },
+    confidence: confidenceNum,
+    prep: [],
+    verification,
     screenshot: `step-${pad}-before.png`,
   };
 }
 
 /**
  * Runs the full investigation pipeline: opens BC, walks each YAML step
- * through the vision see→act→verify loop, and writes a .script.yml.
+ * through the DOM-based 9-step flow, and writes a .script.yml.
  */
 export async function investigate(
   specPath: string,
@@ -439,12 +462,20 @@ export async function investigate(
   const specName = parsePath(specPath).name;
 
   if (!config.anthropicApiKey) {
-    throw new Error('ANTHROPIC_API_KEY is required for vision-based investigation');
+    throw new Error('ANTHROPIC_API_KEY is required for DOM-based investigation');
   }
 
+  const interpreter = new DomInterpreter(config.anthropicApiKey, config.visionModel);
   const vision = new VisionClient(config.anthropicApiKey, config.visionModel);
+
   const screenshotDir = resolve(outputDir, 'screenshots');
   mkdirSync(screenshotDir, { recursive: true });
+
+  // Knowledge bank
+  const knowledgeDir = resolve(outputDir, 'knowledge', 'patterns');
+  mkdirSync(knowledgeDir, { recursive: true });
+  const patterns = loadPatterns(knowledgeDir);
+  info(`Loaded ${patterns.length} knowledge pattern(s)`);
 
   info('Launching headless BC session for investigation...');
   const session = await launchBCSession(config, {
@@ -470,11 +501,6 @@ export async function investigate(
       }
     }
 
-    // Survey the initial page
-    let currentSurvey: PageSurvey | undefined;
-    info('Surveying initial page...');
-    currentSurvey = await surveyCurrentPage(vision, session.page, screenshotDir, 'initial');
-
     for (let i = 0; i < linearSteps.length; i++) {
       const { step } = linearSteps[i];
       const source = toSource(step);
@@ -482,30 +508,17 @@ export async function investigate(
       info(`[investigate] Step ${i + 1}/${linearSteps.length}: ${desc}`);
 
       const scriptStep = await investigateStep(
+        interpreter,
         vision,
         session.page,
         source,
         i,
         screenshotDir,
+        knowledgeDir,
+        patterns,
         options.skipVerify ?? false,
-        currentSurvey,
       );
       scriptSteps.push(scriptStep);
-
-      // If the step verified a page change, re-survey the new page
-      if (
-        scriptStep.verification.success &&
-        scriptStep.verification.afterPage &&
-        scriptStep.verification.beforePage !== scriptStep.verification.afterPage
-      ) {
-        info('Page changed — surveying new page...');
-        currentSurvey = await surveyCurrentPage(
-          vision,
-          session.page,
-          screenshotDir,
-          `after-step${i}`,
-        );
-      }
     }
   } finally {
     await closeBCSession(session);
