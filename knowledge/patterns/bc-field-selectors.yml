@@ -1,0 +1,16 @@
+name: bc-field-selectors
+description: Priority chain for finding BC fields in the DOM
+discovered: 2026-03-27
+successCount: 10
+lastUsed: 2026-03-27
+pattern:
+  identify: "BC fields can be found via multiple DOM patterns. Try in this priority order."
+  interact: |
+    1. td[controlname="FieldName"] input — grid cells with controlname attribute (most reliable)
+    2. [controlname="FieldName"] input — card fields with controlname
+    3. [aria-label="FieldName"] — exact aria-label match on the input itself
+    4. input[aria-label*="FieldName"] — partial aria-label on input elements
+    5. [aria-label*="FieldName"] — partial aria-label (pick shortest label = most specific)
+    6. [title*="FieldName"] — title attribute match (skip elements with title="Open Menu")
+    7. label/caption text match → adjacent sibling input element
+  verify: "The field's input element should accept focus and allow typing. Look for input, textarea, select, [role='textbox'], or [role='combobox'] elements."
