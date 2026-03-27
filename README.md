@@ -29,6 +29,7 @@ BC_PASSWORD_KEY=BC_PASS
 BC_USER=admin
 BC_PASS=password
 OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=<key>
 ```
 
 Generate a demo video:
@@ -51,6 +52,8 @@ Output lands in `output/<spec-name>.mp4`.
 | `--no-trim` | Keep BC loading screen in video |
 | `--no-headed` | Run browser in headless mode |
 | `--output <dir>` | Output directory (default: `./output`) |
+| `--vision-model <id>` | Vision model override (default: `claude-sonnet-4-6-20250514`) |
+| `--no-verify` | Skip verification during investigation |
 
 ## How it works
 

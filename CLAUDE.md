@@ -6,31 +6,45 @@ Automated demo video generator for Continia Banking in Business Central. Produce
 ## Architecture
 
 ```
-YAML spec → OpenAI TTS (per-step clips) → Playwright records BC (delays match audio)
+YAML spec → OpenAI TTS (per-step clips) → Vision investigation (screenshots → Claude Sonnet 4.6)
+                                                    ↓
+                                          .script.yml (coordinates)
+                                                    ↓
+                                          Environment reset (DemoPortal API)
+                                                    ↓
+                                          Playwright records BC (replays coordinates)
                                                     ↓
                                           FFmpeg composes video + audio + subtitles → .mp4
 ```
 
 | Module | Purpose |
 |--------|---------|
-| `src/player.ts` | Playwright-based browser automation — authenticates, navigates via pageId, clicks buttons/rows with animated cursor, records video |
+| `src/browser.ts` | Playwright browser launch, BC authentication, cookie transfer, `awaitBCFrame` |
+| `src/vision.ts` | Claude Sonnet 4.6 vision API client — locate, verify, prompt builders |
+| `src/investigator.ts` | See → act → verify loop — walks YAML steps, produces `.script.yml` |
+| `src/script-player.ts` | Coordinate-based recorder — replays `.script.yml` with cursor animation |
+| `src/script-types.ts` | Types for `.script.yml` format |
+| `src/script-io.ts` | Read/write `.script.yml`, spec hash, cache validation |
+| `src/recorder.ts` | Thin orchestrator — investigation → env reset → script playback |
+| `src/cli.ts` | CLI entry point with full pipeline orchestration |
+| `src/cursor.ts` | Animated cursor overlay (red dot with click pulse) injected into the page |
 | `src/step-audio.ts` | Generates per-step TTS clips, measures durations, builds stepDelays map |
 | `src/narrator.ts` | OpenAI TTS wrapper with BC abbreviation expansion and audio duration probing |
 | `src/subtitle-gen.ts` | ASS subtitle generation with fade-in/out effects |
 | `src/composer.ts` | FFmpeg composition — concat audio track, burn subtitles, trim loading screen |
-| `src/cursor.ts` | Animated cursor overlay (red dot with click pulse) injected into the page |
 | `src/locale-voices.ts` | Locale → OpenAI voice/speed mapping |
-| `src/recorder.ts` | Thin orchestrator between CLI and player |
 | `src/config.ts` | Config from .env and CLI args |
-| `src/cli.ts` | CLI entry point with full pipeline orchestration |
+| `src/env-reset.ts` | DemoPortal environment delete/create/poll |
+| `src/log.ts` | Logging utilities |
 
 ## How it works
 
 1. **Audio-first**: TTS clips are generated per step BEFORE recording. Their durations determine video pacing.
-2. **Two-context recording**: Authenticates in a non-recording context, transfers cookies, then starts recording on the loaded BC page (no login/loading screen in video).
-3. **Real Playwright clicks**: Buttons and rows are clicked via Playwright locators (not BC's internal `DN.playRecording`), so clicks are visible in the video.
-4. **Animated cursor**: A red dot glides to each click target with a ripple pulse effect.
-5. **FFmpeg post-processing**: Trims the "Getting Ready" loading screen, concatenates step audio with silence gaps, burns ASS subtitles with fade effects.
+2. **Vision investigation**: A headless browser opens BC, and Claude Sonnet 4.6 locates each element via screenshots, producing a `.script.yml` with exact coordinates.
+3. **Environment reset**: BC environment is deleted and recreated between investigation and recording so data is fresh.
+4. **Coordinate replay**: The recording phase replays the `.script.yml` mechanically — clicking coordinates, typing values. No DOM queries.
+5. **Animated cursor**: A red dot glides to each click target with a ripple pulse effect.
+6. **FFmpeg post-processing**: Trims the "Getting Ready" loading screen, concatenates step audio with silence gaps, burns ASS subtitles with fade effects.
 
 ## CLI usage
 
@@ -45,10 +59,12 @@ node dist/cli.js <spec.yml>
 node dist/cli.js <spec.yml> --skip-record --narrate
 
 # Options
---voice <name>     # OpenAI voice: alloy, echo, fable, onyx, nova (default), shimmer
---no-subs          # Skip subtitle generation
---no-trim          # Keep BC loading screen in video
---no-headed        # Run headless (no visible browser)
+--voice <name>       # OpenAI voice: alloy, echo, fable, onyx, nova (default), shimmer
+--no-subs            # Skip subtitle generation
+--no-trim            # Keep BC loading screen in video
+--no-headed          # Run headless (no visible browser)
+--vision-model <id>  # Vision model override (default: claude-sonnet-4-6-20250514)
+--no-verify          # Skip verification during investigation
 ```
 
 ## Environment variables (.env)
@@ -61,6 +77,7 @@ BC_PASSWORD_KEY=BC_PASS
 BC_USER=<username>
 BC_PASS=<password>
 OPENAI_API_KEY=<key>
+ANTHROPIC_API_KEY=<key>
 OUTPUT_DIR=./output
 ```
 
