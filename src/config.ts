@@ -23,6 +23,6 @@ export function loadConfig(overrides?: Partial<DemoConfig>): DemoConfig {
     outputDir: overrides?.outputDir ?? process.env['OUTPUT_DIR'] ?? './output',
     headed: overrides?.headed ?? true,
     anthropicApiKey: overrides?.anthropicApiKey ?? process.env['ANTHROPIC_API_KEY'],
-    visionModel: overrides?.visionModel ?? 'claude-sonnet-4-6-20250514',
+    visionModel: overrides?.visionModel ?? 'claude-sonnet-4-6',
   };
 }
