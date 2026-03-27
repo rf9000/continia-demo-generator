@@ -191,72 +191,6 @@ export function parseVerifyResponse(text: string): VerifyResult {
   };
 }
 
-/** Builds the prompt for a full page survey. */
-export function buildSurveyPrompt(): string {
-  return `You are looking at multiple screenshots of the same Business Central page, taken at different scroll positions (top to bottom). Together they show the COMPLETE page content.
-
-Describe the full page structure in detail:
-
-1. **Page type and title** — What kind of BC page is this? (list, card, document, dialog)
-2. **Action bar** — What buttons/actions are in the toolbar?
-3. **FastTabs** — List EVERY FastTab section you can see across all screenshots. For each:
-   - Name of the FastTab
-   - Is it expanded or collapsed?
-   - If expanded: list ALL visible field labels (caption: value pairs)
-4. **Grid/table** — If there's a data grid, describe its columns and row count
-5. **Notifications** — Any notification banners visible?
-
-Be EXHAUSTIVE — list every field label you can read, even if partially visible. This inventory will be used to locate specific fields later.
-
-Respond with JSON:
-{
-  "pageType": "list|card|document|dialog",
-  "pageTitle": "<page title>",
-  "actionBar": ["<button1>", "<button2>", ...],
-  "fastTabs": [
-    {
-      "name": "<FastTab name>",
-      "expanded": true|false,
-      "fields": ["<field1>", "<field2>", ...]
-    }
-  ],
-  "grid": { "columns": ["<col1>", ...], "rowCount": <n> } | null,
-  "notifications": ["<notification text>", ...],
-  "scrollPosition": "<description of what part of the page is visible>"
-}`;
-}
-
-/** Parsed result from a page survey. */
-export interface PageSurvey {
-  pageType: string;
-  pageTitle: string;
-  actionBar: string[];
-  fastTabs: Array<{
-    name: string;
-    expanded: boolean;
-    fields: string[];
-  }>;
-  grid: { columns: string[]; rowCount: number } | null;
-  notifications: string[];
-}
-
-/** Parses a survey response from the vision model. */
-export function parseSurveyResponse(text: string): PageSurvey {
-  const json = JSON.parse(extractJson(text));
-  return {
-    pageType: json.pageType ?? 'unknown',
-    pageTitle: json.pageTitle ?? '',
-    actionBar: json.actionBar ?? [],
-    fastTabs: (json.fastTabs ?? []).map((ft: Record<string, unknown>) => ({
-      name: (ft.name as string) ?? '',
-      expanded: ft.expanded === true,
-      fields: (ft.fields as string[]) ?? [],
-    })),
-    grid: json.grid ?? null,
-    notifications: json.notifications ?? [],
-  };
-}
-
 /** Vision API client wrapping the Anthropic SDK. */
 export class VisionClient {
   private client: Anthropic;
@@ -294,58 +228,11 @@ export class VisionClient {
     return textBlock?.text ?? '';
   }
 
-  /**
-   * Surveys a page by analyzing multiple screenshots taken at different scroll positions.
-   * Returns a structured description of the complete page layout.
-   */
-  async surveyPage(screenshots: Buffer[]): Promise<PageSurvey> {
-    const prompt = buildSurveyPrompt();
-    debug(`Vision survey: ${screenshots.length} screenshots`);
-    const text = await this.call(prompt, screenshots, 4096);
-    debug(`Vision survey response: ${text.slice(0, 300)}`);
-    return parseSurveyResponse(text);
-  }
-
   /** Locates an element on screen given a screenshot and step source. */
   async locate(screenshot: Buffer, source: ScriptStepSource): Promise<LocateResult> {
     const prompt = source.type === 'input' ? buildInputPrompt(source) : buildLocatePrompt(source);
     debug(`Vision locate: ${source.caption ?? source.field ?? source.row ?? 'unknown'}`);
     const text = await this.call(prompt, [screenshot]);
-    debug(`Vision response: ${text.slice(0, 200)}`);
-    return parseLocateResponse(text);
-  }
-
-  /**
-   * Locates an element with page survey context. Sends the current screenshot
-   * plus the survey description so the model knows the full page structure.
-   */
-  async locateWithContext(
-    screenshot: Buffer,
-    source: ScriptStepSource,
-    survey: PageSurvey,
-  ): Promise<LocateResult> {
-    const basePrompt =
-      source.type === 'input' ? buildInputPrompt(source) : buildLocatePrompt(source);
-
-    // Find which FastTab contains the field
-    const fieldName = source.field ?? source.caption ?? '';
-    const matchingTab = survey.fastTabs.find((ft) =>
-      ft.fields.some((f) => f.toLowerCase().includes(fieldName.toLowerCase())),
-    );
-
-    const surveyContext = `
-## Page Context (from full page survey)
-Page type: ${survey.pageType} — "${survey.pageTitle}"
-Action bar buttons: ${survey.actionBar.join(', ')}
-FastTabs: ${survey.fastTabs.map((ft) => `${ft.name} (${ft.expanded ? 'expanded' : 'collapsed'}, fields: ${ft.fields.join(', ') || 'none visible'})`).join(' | ')}
-${matchingTab ? `\nThe field "${fieldName}" was found in the "${matchingTab.name}" FastTab during the page survey.${!matchingTab.expanded ? ` This FastTab is COLLAPSED — it needs to be expanded first by clicking on its header.` : ` This FastTab is expanded — scroll to it.`}` : `\nThe field "${fieldName}" was NOT found in any FastTab during the survey. It may be hidden behind "Show more" in one of the FastTabs.`}
-`;
-
-    const prompt = surveyContext + '\n' + basePrompt;
-    debug(
-      `Vision locate (with context): ${source.caption ?? source.field ?? source.row ?? 'unknown'}`,
-    );
-    const text = await this.call(prompt, [screenshot], 2048);
     debug(`Vision response: ${text.slice(0, 200)}`);
     return parseLocateResponse(text);
   }
