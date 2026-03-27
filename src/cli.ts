@@ -12,12 +12,7 @@ import { generateStepAudio } from './step-audio.js';
 import { generateSubtitles } from './subtitle-gen.js';
 import { getVoiceForLocale, type VoiceConfig } from './locale-voices.js';
 import { setVerbose, header, info } from './log.js';
-import {
-  writeEnrichedSpec,
-  isEnrichedSpecValid,
-  isFullyEnriched,
-  readDiscoveries,
-} from './enricher.js';
+import { isEnrichedSpecValid, isFullyEnriched } from './enricher.js';
 import { resetEnvironment, extractEnvId } from './env-reset.js';
 import type { StepTimingMetadata } from './player.js';
 
@@ -136,10 +131,7 @@ program
       }
 
       // ── Phase 0: Investigation ──────────────────────────────
-      let recordSpecPath = specPath; // spec to use for recording (may become enriched)
-      let discoveries = existsSync(enrichedSpecPath)
-        ? readDiscoveries(enrichedSpecPath)
-        : undefined;
+      const recordSpecPath = specPath; // spec to use for recording (may become enriched)
 
       if (shouldInvestigate) {
         header('Investigation');
@@ -154,11 +146,7 @@ program
           } else {
             process.exit(1);
           }
-        } else if (investResult.discoveries) {
-          const enrichedPath = writeEnrichedSpec(specPath, investResult.discoveries, outputDir);
-          recordSpecPath = enrichedPath;
-          discoveries = investResult.discoveries;
-
+        } else if (investResult.success) {
           if (investigateOnly) {
             console.log('\nDone! (investigate-only)');
             process.exit(0);
@@ -183,16 +171,6 @@ program
         }
       }
 
-      // If we have an enriched spec, read discoveries for the recording
-      if (
-        existsSync(enrichedSpecPath) &&
-        isEnrichedSpecValid(specPath, enrichedSpecPath) &&
-        !discoveries
-      ) {
-        discoveries = readDiscoveries(enrichedSpecPath);
-        recordSpecPath = enrichedSpecPath;
-      }
-
       // Determine pipeline: per-step narration (preferred) or single narration (fallback)
       const useStepNarration =
         options.narrate && stepNarration && Object.keys(stepNarration).length > 0;
@@ -213,7 +191,6 @@ program
         header('Recording');
         const result = await recordDemo(recordSpecPath, config, {
           stepDelays: stepAudioPlan?.stepDelays,
-          discoveries,
         });
         if (result.success) {
           timing = result.timing;

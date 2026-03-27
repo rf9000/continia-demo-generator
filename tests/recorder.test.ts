@@ -12,6 +12,7 @@ describe('recordDemo input validation', () => {
       bcAuth: 'Windows',
       outputDir: './output',
       headed: false,
+      visionModel: 'claude-sonnet-4-6-20250514',
     });
 
     expect(result.success).toBe(false);
@@ -28,21 +29,30 @@ describe('recordDemo execution', () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  test('returns error when BC is unreachable', { timeout: 30_000 }, async () => {
-    const specFile = join(tmpDir, 'test-spec.yml');
-    writeFileSync(
-      specFile,
-      'description: test\nsteps:\n  - type: action\n    target:\n      - page: Test\n    caption: OK',
-    );
+  test(
+    'returns error when script file is missing in record mode',
+    { timeout: 10_000 },
+    async () => {
+      const specFile = join(tmpDir, 'test-spec.yml');
+      writeFileSync(
+        specFile,
+        'description: test\nsteps:\n  - type: action\n    target:\n      - page: Test\n    caption: OK',
+      );
 
-    const result = await recordDemo(specFile, {
-      bcStartAddress: 'http://localhost:19222/bc/',
-      bcAuth: 'Windows',
-      outputDir: join(tmpDir, 'output'),
-      headed: false,
-    });
+      const result = await recordDemo(
+        specFile,
+        {
+          bcStartAddress: 'http://localhost:19222/bc/',
+          bcAuth: 'Windows',
+          outputDir: join(tmpDir, 'output'),
+          headed: false,
+          visionModel: 'claude-sonnet-4-6-20250514',
+        },
+        { mode: 'record' },
+      );
 
-    expect(result.success).toBe(false);
-    expect(result.error).toBeDefined();
-  });
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('No script found');
+    },
+  );
 });
