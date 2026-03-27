@@ -3,9 +3,19 @@ import { debug } from './log.js';
 
 /** Attributes to keep during HTML cleaning. */
 const KEEP_ATTRS = [
-  'role', 'aria-label', 'aria-expanded', 'aria-selected', 'aria-checked',
-  'aria-disabled', 'aria-haspopup', 'controlname', 'title', 'type', 'value',
-  'placeholder', 'name',
+  'role',
+  'aria-label',
+  'aria-expanded',
+  'aria-selected',
+  'aria-checked',
+  'aria-disabled',
+  'aria-haspopup',
+  'controlname',
+  'title',
+  'type',
+  'value',
+  'placeholder',
+  'name',
 ];
 
 /** Tags to strip entirely (including contents). */
@@ -44,9 +54,19 @@ export async function extractPageHtml(frame: Frame): Promise<{
 }> {
   const result = await frame.evaluate(() => {
     const KEEP = [
-      'role', 'aria-label', 'aria-expanded', 'aria-selected', 'aria-checked',
-      'aria-disabled', 'aria-haspopup', 'controlname', 'title', 'type', 'value',
-      'placeholder', 'name',
+      'role',
+      'aria-label',
+      'aria-expanded',
+      'aria-selected',
+      'aria-checked',
+      'aria-disabled',
+      'aria-haspopup',
+      'controlname',
+      'title',
+      'type',
+      'value',
+      'placeholder',
+      'name',
     ];
     const STRIP = new Set(['SCRIPT', 'STYLE', 'SVG', 'NOSCRIPT', 'LINK', 'META']);
     const MAX_TEXT = 50;
@@ -98,7 +118,12 @@ export async function extractPageHtml(frame: Frame): Promise<{
 
       // Skip hidden elements
       if (el.style.display === 'none' || el.style.visibility === 'hidden') return '';
-      if (el.offsetWidth === 0 && el.offsetHeight === 0 && !el.querySelector('input, select, textarea')) return '';
+      if (
+        el.offsetWidth === 0 &&
+        el.offsetHeight === 0 &&
+        !el.querySelector('input, select, textarea')
+      )
+        return '';
 
       // Collect kept attributes
       const attrs: string[] = [];
@@ -111,9 +136,11 @@ export async function extractPageHtml(frame: Frame): Promise<{
 
       // Add first meaningful class (skip BC's generated hash classes)
       const className = el.className?.toString() || '';
-      const classes = className.split(/\s+/).filter(
-        (c) => c.length > 3 && c.length < 40 && !c.includes('--') && !/^[a-z]{5,}$/.test(c),
-      );
+      const classes = className
+        .split(/\s+/)
+        .filter(
+          (c) => c.length > 3 && c.length < 40 && !c.includes('--') && !/^[a-z]{5,}$/.test(c),
+        );
       if (classes.length > 0) {
         attrs.push(`class="${classes[0]}"`);
       }
@@ -204,17 +231,24 @@ export function cleanHtml(rawHtml: string): string {
   html = html.replace(/<[^>]*style="[^"]*display:\s*none[^"]*"[^>]*>[\s\S]*?<\/[^>]+>/gi, '');
 
   // Strip attributes not in KEEP_ATTRS list (keep the element, remove the attr)
-  html = html.replace(/\s+(?!role|aria-|controlname|title|type|value|placeholder|name)[a-z][\w-]*="[^"]*"/gi, '');
+  const keepPattern = KEEP_ATTRS.map((a) => a.replace('-', '\\-')).join('|');
+  html = html.replace(new RegExp(`\\s+(?!${keepPattern})[a-z][\\w-]*="[^"]*"`, 'gi'), '');
 
   // Collapse empty wrapper divs: <div><div><span>X</span></div></div> → <span>X</span>
   let prev = '';
   while (prev !== html) {
     prev = html;
-    html = html.replace(/<div>\s*(<(?:div|span|section|input|button|nav|header)[^>]*>[\s\S]*?<\/(?:div|span|section|input|button|nav|header)>)\s*<\/div>/gi, '$1');
+    html = html.replace(
+      /<div>\s*(<(?:div|span|section|input|button|nav|header)[^>]*>[\s\S]*?<\/(?:div|span|section|input|button|nav|header)>)\s*<\/div>/gi,
+      '$1',
+    );
   }
 
   // Truncate long text
-  html = html.replace(/>([^<]{51,})</g, (_, text: string) => '>' + text.slice(0, MAX_TEXT_LENGTH) + '...<');
+  html = html.replace(
+    />([^<]{51,})</g,
+    (_, text: string) => '>' + text.slice(0, MAX_TEXT_LENGTH) + '...<',
+  );
 
   return html.trim();
 }
