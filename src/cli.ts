@@ -12,16 +12,16 @@ import { generateStepAudio } from './step-audio.js';
 import { generateSubtitles } from './subtitle-gen.js';
 import { getVoiceForLocale, type VoiceConfig } from './locale-voices.js';
 import { setVerbose, header, info } from './log.js';
-import { isEnrichedSpecValid, isFullyEnriched } from './enricher.js';
+import { isScriptValid } from './script-io.js';
 import { resetEnvironment, extractEnvId } from './env-reset.js';
-import type { StepTimingMetadata } from './player.js';
+import type { ScriptPlayResult } from './script-player.js';
 
 const program = new Command();
 
 program
   .name('generate-demo')
   .description('Generate demo videos from BC Page Scripting YAML specs')
-  .version('0.4.0');
+  .version('0.5.0');
 
 program
   .argument('<spec>', 'Path to the BC Page Scripting YAML spec file')
@@ -34,8 +34,13 @@ program
   .option('--skip-record', 'Skip recording, only generate narration and compose')
   .option('--no-subs', 'Skip subtitle generation and burn-in')
   .option('--no-trim', 'Keep login/auth in the video (debugging)')
-  .option('--investigate-only', 'Run investigation only — write enriched spec and exit')
-  .option('--no-investigate', 'Skip investigation — use spec as-is (current behavior)')
+  .option('--investigate-only', 'Run investigation only — write script and exit')
+  .option('--no-investigate', 'Skip investigation — use existing script')
+  .option(
+    '--vision-model <model>',
+    'Vision model for investigation (default: claude-sonnet-4-6-20250514)',
+  )
+  .option('--no-verify', 'Skip verification step during investigation')
   .option('-v, --verbose', 'Show detailed debug output')
   .action(
     async (
@@ -52,6 +57,8 @@ program
         trim?: boolean;
         investigateOnly?: boolean;
         investigate?: boolean;
+        visionModel?: string;
+        verify?: boolean;
         verbose?: boolean;
       },
     ) => {
@@ -73,19 +80,17 @@ program
         bcAuth: options.bcAuth as 'Windows' | 'AAD' | 'UserPassword' | undefined,
         outputDir: options.output,
         headed: options.headed,
+        visionModel: options.visionModel,
       });
 
       const specName = parsePath(specPath).name;
       const outputDir = resolve(config.outputDir, specName);
-
-      // Point config.outputDir at the spec-specific subfolder
       config.outputDir = outputDir;
 
       let videoPath = resolve(outputDir, `${specName}.webm`);
       const finalPath = resolve(outputDir, `${specName}.mp4`);
       const srtPath = resolve(outputDir, `${specName}.srt`);
-      const timingJsonPath = resolve(outputDir, `${specName}.timing.json`);
-      const enrichedSpecPath = resolve(outputDir, `${specName}.enriched.yml`);
+      const scriptPath = resolve(outputDir, `${specName}.script.yml`);
 
       // Parse spec for metadata
       const specContent = readFileSync(specPath, 'utf-8');
@@ -106,53 +111,65 @@ program
       console.log('Continia Demo Generator');
       info(`Spec: ${specName}`);
 
-      // --no-investigate is stored as options.investigate = false by commander
       const skipInvestigate = options.investigate === false;
       const investigateOnly = options.investigateOnly === true;
+      const skipVerify = options.verify === false;
 
       if (skipInvestigate && investigateOnly) {
         console.error('Error: --no-investigate and --investigate-only are mutually exclusive');
         process.exit(1);
       }
 
-      // Determine if investigation is needed
-      let shouldInvestigate = !skipInvestigate && !options.skipRecord;
-
-      // Auto-skip if enriched spec exists and is up to date
-      if (shouldInvestigate && !investigateOnly) {
-        if (
-          existsSync(enrichedSpecPath) &&
-          isFullyEnriched(enrichedSpecPath) &&
-          isEnrichedSpecValid(specPath, enrichedSpecPath)
-        ) {
-          info('Enriched spec is up to date — skipping investigation');
-          shouldInvestigate = false;
+      // Determine mode
+      let mode: 'investigate' | 'record' | 'full';
+      if (investigateOnly) {
+        mode = 'investigate';
+      } else if (skipInvestigate || options.skipRecord) {
+        mode = 'record';
+      } else {
+        if (existsSync(scriptPath) && isScriptValid(specPath, scriptPath)) {
+          info('Script cache is valid — skipping investigation');
+          mode = 'record';
+        } else {
+          mode = 'full';
         }
       }
 
-      // ── Phase 0: Investigation ──────────────────────────────
-      const recordSpecPath = specPath; // spec to use for recording (may become enriched)
+      // Determine pipeline: per-step narration or single narration
+      const useStepNarration =
+        options.narrate && stepNarration && Object.keys(stepNarration).length > 0;
+      const useSingleNarration = options.narrate && !useStepNarration && narrationText;
 
-      if (shouldInvestigate) {
-        header('Investigation');
-        const investResult = await recordDemo(specPath, config, {
-          mode: 'investigate',
-        });
+      let timing: ScriptPlayResult['timing'] | undefined;
 
-        if (!investResult.success) {
-          console.error(`\nInvestigation failed: ${investResult.error}`);
-          if (!investigateOnly) {
-            info('Proceeding with recording using original spec...');
-          } else {
+      // ── Phase A: Generate per-step audio (before recording) ──
+      let stepAudioPlan: Awaited<ReturnType<typeof generateStepAudio>> | undefined;
+      if (useStepNarration && !options.skipRecord) {
+        header('Narration');
+        stepAudioPlan = await generateStepAudio(stepNarration!, specName, outputDir, voiceConfig);
+      }
+
+      // ── Phase B: Investigation + Recording ──
+      if (!options.skipRecord) {
+        if (mode === 'full' || mode === 'investigate') {
+          header('Investigation');
+        }
+
+        // For full mode: investigate first, then reset env, then record
+        if (mode === 'full') {
+          // Investigation
+          const investResult = await recordDemo(specPath, config, {
+            mode: 'investigate',
+            skipVerify,
+          });
+
+          if (!investResult.success) {
+            console.error(`\nInvestigation failed: ${investResult.error}`);
+            info('Cannot proceed without investigation results.');
             process.exit(1);
           }
-        } else if (investResult.success) {
-          if (investigateOnly) {
-            console.log('\nDone! (investigate-only)');
-            process.exit(0);
-          }
 
-          // ── Environment Reset ──────────────────────────────
+          // Environment reset
           header('Environment Reset');
           const envId = extractEnvId(config.bcStartAddress);
           if (envId) {
@@ -168,51 +185,60 @@ program
           } else {
             info('Cannot determine envId from URL — skipping environment reset');
           }
-        }
-      }
 
-      // Determine pipeline: per-step narration (preferred) or single narration (fallback)
-      const useStepNarration =
-        options.narrate && stepNarration && Object.keys(stepNarration).length > 0;
-      const useSingleNarration = options.narrate && !useStepNarration && narrationText;
+          // Recording
+          header('Recording');
+          const recordResult = await recordDemo(specPath, config, {
+            stepDelays: stepAudioPlan?.stepDelays,
+            mode: 'record',
+          });
 
-      let timing: StepTimingMetadata | undefined;
+          if (recordResult.success) {
+            timing = recordResult.timing;
+            if (recordResult.videoPath) videoPath = recordResult.videoPath;
+          } else {
+            console.error(`\nFailed to record: ${recordResult.error}`);
+            process.exit(1);
+          }
+        } else if (mode === 'investigate') {
+          // Investigate only
+          const result = await recordDemo(specPath, config, {
+            mode: 'investigate',
+            skipVerify,
+          });
 
-      // ── Phase A: Generate per-step audio (before recording, to get delays) ──
-      let stepAudioPlan: Awaited<ReturnType<typeof generateStepAudio>> | undefined;
-
-      if (useStepNarration && !options.skipRecord) {
-        header('Narration');
-        stepAudioPlan = await generateStepAudio(stepNarration!, specName, outputDir, voiceConfig);
-      }
-
-      // ── Phase B: Record video ──
-      if (!options.skipRecord) {
-        header('Recording');
-        const result = await recordDemo(recordSpecPath, config, {
-          stepDelays: stepAudioPlan?.stepDelays,
-        });
-        if (result.success) {
-          timing = result.timing;
-          if (result.videoPath) videoPath = result.videoPath;
+          if (result.success) {
+            info(`Script written to: ${result.scriptPath}`);
+            console.log('\nDone! (investigate-only)');
+          } else {
+            console.error(`\nInvestigation failed: ${result.error}`);
+            process.exit(1);
+          }
+          process.exit(0);
         } else {
-          console.error(`\nFailed to record: ${result.error}`);
-          process.exit(1);
+          // Record only (mode === 'record')
+          header('Recording');
+          const result = await recordDemo(specPath, config, {
+            stepDelays: stepAudioPlan?.stepDelays,
+            mode: 'record',
+          });
+
+          if (result.success) {
+            timing = result.timing;
+            if (result.videoPath) videoPath = result.videoPath;
+          } else {
+            console.error(`\nFailed to record: ${result.error}`);
+            process.exit(1);
+          }
         }
       } else {
-        // Load existing video and timing
+        // --skip-record: use existing video
         if (!existsSync(videoPath)) {
           console.error(`Error: --skip-record but no video found at ${videoPath}`);
           process.exit(1);
         }
         info(`Using existing video: ${videoPath}`);
 
-        if (existsSync(timingJsonPath)) {
-          timing = JSON.parse(readFileSync(timingJsonPath, 'utf-8')) as StepTimingMetadata;
-          info(`Loaded timing from: ${timingJsonPath}`);
-        }
-
-        // Generate step audio if needed (may not have been generated before)
         if (useStepNarration && !stepAudioPlan) {
           header('Narration');
           stepAudioPlan = await generateStepAudio(stepNarration!, specName, outputDir, voiceConfig);
@@ -223,16 +249,19 @@ program
       if (useStepNarration && stepAudioPlan && timing) {
         header('Composing');
 
-        // Generate subtitles
         let subtitlePath: string | undefined;
         if (options.subs !== false) {
-          subtitlePath = generateSubtitles(stepAudioPlan.clips, timing, srtPath);
+          subtitlePath = generateSubtitles(
+            stepAudioPlan.clips,
+            timing as Parameters<typeof generateSubtitles>[1],
+            srtPath,
+          );
         }
 
         const compResult = await composeWithStepAudio({
           videoPath,
           clips: stepAudioPlan.clips,
-          timing,
+          timing: timing as Parameters<typeof composeWithStepAudio>[0]['timing'],
           subtitlePath,
           outputPath: finalPath,
           trimLogin: options.trim !== false,
@@ -268,12 +297,11 @@ program
 
       // ── Cleanup intermediate files ──
       if (existsSync(finalPath)) {
-        const keep = new Set([finalPath, enrichedSpecPath]);
-
+        const keep = new Set([finalPath, scriptPath]);
         for (const file of readdirSync(outputDir)) {
           const fullPath = resolve(outputDir, file);
           if (keep.has(fullPath)) continue;
-          if (file === 'narration') {
+          if (file === 'narration' || file === 'screenshots') {
             rmSync(fullPath, { recursive: true, force: true });
           } else if (
             file.endsWith('.webm') ||
