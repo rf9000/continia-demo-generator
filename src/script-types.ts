@@ -50,6 +50,19 @@ export interface ScriptStep {
   screenshot: string;
 }
 
+/** One entry in the step timing metadata. */
+export interface StepTimingEntry {
+  stepIndex: number;
+  startMs: number;
+  endMs: number;
+}
+
+/** Timing metadata produced by the script player for the composer/subtitle modules. */
+export interface StepTimingMetadata {
+  trimStartMs: number;
+  steps: StepTimingEntry[];
+}
+
 /** The top-level .script.yml file. */
 export interface ScriptFile {
   specHash: string;

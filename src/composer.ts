@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { resolve, dirname, join } from 'path';
 import { createRequire } from 'module';
 import type { StepAudioClip } from './step-audio.js';
-import type { StepTimingMetadata } from './player.js';
+import type { StepTimingMetadata } from './script-types.js';
 import { info, debug } from './log.js';
 
 function getFFmpegPath(): string {

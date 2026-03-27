@@ -1,7 +1,7 @@
 import { writeFileSync } from 'fs';
 import { resolve } from 'path';
 import type { StepAudioClip } from './step-audio.js';
-import type { StepTimingMetadata } from './player.js';
+import type { StepTimingMetadata } from './script-types.js';
 import { info } from './log.js';
 
 const FADE_IN_MS = 300;
